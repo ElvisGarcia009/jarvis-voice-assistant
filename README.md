@@ -13,9 +13,10 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 - **Real actions on your PC**: requests are handled by Claude Code in non-interactive mode, with a safety-first permission mode.
 - **Fast local voice**: [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) speaks while the rest of the answer is still being generated. You can blend voices and make them deeper. Edge TTS is available as an online alternative or fallback.
 - **Multilingual speech recognition** with Groq Whisper (free API key).
+- **Interrupt by voice**: start talking while Jarvis speaks and he stops and listens, keeping your first words. With speakers instead of a headset, switch to `wakeword` mode and say "Hey Jarvis" to interrupt.
 - **Natural conversation**: keep talking without repeating the wake word. Say "thank you" (or "OK, thank you", "that's all", "gracias"...) and Jarvis goes back to sleep.
 - **Language practice mode**: Jarvis can always answer in a language you are learning, and tell you how to say your request in that language when you switch to your native one.
-- **Visual feedback**: a small window shows whether Jarvis is sleeping, listening, thinking or speaking, plus the conversation. It has buttons to talk, interrupt and end, and it hides itself when the conversation is over.
+- **A floating bubble, not a chat window**: a translucent capsule at the bottom of the screen with an animated orb. The orb breathes while Jarvis sleeps, swells with your voice while it listens, spins while it thinks and ripples with its own voice while it speaks. Captions show what you said and the sentence Jarvis is saying right now. Click the orb to interrupt. The bubble hides itself when the conversation ends.
 - **Runs in the background** as a systemd user service and starts with your desktop.
 
 ## How it works
@@ -40,7 +41,7 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 ## Requirements
 
 - Linux with **PipeWire** (`pw-record`, `pw-play`) and **systemd**. This covers most modern distributions.
-- **Python 3.11+** with `venv` and the **GTK 3** bindings (`python3-gi`).
+- **Python 3.11+** with `venv`, the **GTK 3** bindings (`python3-gi`, `python3-gi-cairo`) and, optionally, **gtk-layer-shell** so the bubble floats above other windows on Wayland.
 - **[Claude Code](https://docs.claude.com/en/docs/claude-code/overview)** installed and logged in, with a Claude subscription or API access.
 - A free **[Groq API key](https://console.groq.com/keys)** for speech recognition.
 - About 500 MB of disk space for the Python packages and voice models.
@@ -54,11 +55,11 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
 
    ```bash
    # Debian / Ubuntu / Pop!_OS
-   sudo apt install python3-venv python3-gi gir1.2-gtk-3.0 pipewire-bin curl git
+   sudo apt install python3-venv python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-gtklayershell-0.1 pipewire-bin curl git
    # Fedora
-   sudo dnf install python3-gobject gtk3 pipewire-utils curl git
+   sudo dnf install python3-gobject python3-cairo gtk3 gtk-layer-shell pipewire-utils curl git
    # Arch
-   sudo pacman -S python-gobject gtk3 pipewire curl git
+   sudo pacman -S python-gobject python-cairo gtk3 gtk-layer-shell pipewire curl git
    ```
 
 2. Install Claude Code and log in, if you have not already:
@@ -84,10 +85,10 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
 
 | Action | How |
 |---|---|
-| Wake Jarvis | Say "Hey Jarvis", or press **🎤 Talk** in its window |
+| Wake Jarvis | Say "Hey Jarvis", or run `systemctl --user kill --kill-whom=main -s USR1 jarvis` (bind it to a keyboard shortcut) |
 | Ask something | Just talk after the greeting |
-| Interrupt | Press **🤫 Stop talking** |
-| Finish | Say "thank you" / "OK, thank you" / "that's all", stay silent, or press **✋ End** |
+| Interrupt | Just start talking (or say "Hey Jarvis" in `wakeword` mode), click the orb, or the ■ button |
+| Finish | Say "thank you" / "OK, thank you" / "that's all", stay silent, or click ✕ |
 
 Service commands:
 

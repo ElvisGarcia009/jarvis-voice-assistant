@@ -13,8 +13,8 @@ Pipeline:
   5. Kokoro (local, fast) or Edge TTS (online) speaks the answer.
   6. The conversation continues until you say "thank you" or stay silent.
 
-A small GTK window shows the state (sleeping / listening / thinking / speaking),
-the conversation, and buttons to talk, interrupt, or end.
+A floating bubble (jarvis_ui.py) shows an animated orb for the state
+(sleeping / listening / thinking / speaking) and live captions.
 
 Files:
   ~/.config/jarvis/config.toml      settings (see config.example.toml)
@@ -28,6 +28,7 @@ import fcntl
 import glob
 import io
 import json
+import math
 import logging
 import os
 import queue
@@ -38,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import unicodedata
 import wave
@@ -47,7 +49,9 @@ import requests
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib, Pango  # noqa: E402
+from gi.repository import Gtk, GLib  # noqa: E402
+
+from jarvis_ui import Bubble  # noqa: E402
 
 # ----------------------------------------------------------------------------
 # Paths and settings
@@ -81,8 +85,14 @@ DEFAULTS = {
     },
     "claude": {"model": "sonnet", "permission_mode": "auto", "timeout": 300},
     "wake": {"threshold": 0.5},
-    "listening": {"wait_for_speech": 10.0, "end_silence": 1.2, "max_utterance": 30.0},
+    "listening": {"wait_for_speech": 10.0, "end_silence": 2.0, "max_utterance": 60.0,
+                  "continue_wait": 4.0},
     "ui": {"show_on_start": False},
+    "interrupt": {
+        "mode": "voice",        # "voice": just start talking | "wakeword": say "Hey Jarvis" | "off"
+        "min_speech": 0.30,     # seconds of your voice needed to interrupt (avoids coughs)
+        "vad_threshold": 0.50,  # how sure it must be that it's a human voice (0..1)
+    },
 }
 
 
@@ -124,6 +134,13 @@ REQUEST_WORDS = re.compile(
     r"\b(open|close|search|find|play|tell|show|install|check|start|run|what|how|why|"
     r"where|when|can you|could you|please|abre|cierra|busca|pon|dime|muestra|instala|"
     r"revisa|cuanto|donde|puedes)\b")
+# If a sentence ends with one of these words, the user probably paused to think
+UNFINISHED_WORDS = {
+    "and", "but", "or", "so", "because", "then", "um", "uh", "uhm", "like", "the", "a",
+    "an", "to", "of", "with", "for", "my", "your", "if", "about",
+    "y", "o", "pero", "que", "porque", "entonces", "este", "eh", "em", "mmm", "de", "el",
+    "la", "los", "las", "un", "una", "mi", "con", "para", "por", "si", "como", "en",
+}
 # Phrases Whisper tends to hallucinate on pure noise
 HALLUCINATIONS = ["amara.org", "subtitulos", "subtitles by", "suscribete"]
 
@@ -157,11 +174,29 @@ def normalize(text):
     return re.sub(r"[^\w\s']", " ", text).strip()
 
 
+def rms(chunk):
+    return float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+
+
 def is_goodbye(text):
     clean = normalize(text)
     if not any(re.search(r"\b" + re.escape(p) + r"\b", clean) for p in END_PHRASES):
         return False
     return len(clean.split()) <= 12 and not REQUEST_WORDS.search(clean)
+
+
+def looks_unfinished(text):
+    """True if the sentence seems cut in the middle ("open the folder and...")."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(("...", "…", ",", "-", "—")):
+        return True
+    if stripped[-1] in ".?!":
+        # Whisper often adds a final period even when you only paused
+        stripped = stripped[:-1]
+    words = normalize(stripped).split()
+    return bool(words) and words[-1] in UNFINISHED_WORDS
 
 
 def notify(title, body):
@@ -283,133 +318,6 @@ class Microphone:
 
 
 # ----------------------------------------------------------------------------
-# Window
-# ----------------------------------------------------------------------------
-CSS = b"""
-window.jarvis { background: #15171c; }
-.status-box { background: #1f232b; border-radius: 14px; padding: 14px; }
-.status-icon { font-size: 34px; }
-.status-text { color: #e8eaed; font-size: 16px; font-weight: bold; }
-.status-sub { color: #9aa0a6; font-size: 12px; }
-.sleeping { border: 2px solid #3c4043; }
-.listening { border: 2px solid #34a853; }
-.thinking { border: 2px solid #fbbc04; }
-.speaking { border: 2px solid #4f8ef7; }
-.bubble-user { background: #2b3a55; color: #e8eaed; border-radius: 12px; padding: 8px 12px; }
-.bubble-jarvis { background: #262a31; color: #e8eaed; border-radius: 12px; padding: 8px 12px; }
-.who { color: #9aa0a6; font-size: 11px; font-weight: bold; }
-button { border-radius: 10px; }
-"""
-
-STATES = {
-    "sleeping":  ("😴", "Sleeping", "Say “Hey Jarvis” to wake me up"),
-    "listening": ("👂", "Listening…", "Speak now"),
-    "thinking":  ("🧠", "Thinking…", "Working on your request"),
-    "speaking":  ("🔊", "Speaking…", "Press “Stop talking” to interrupt"),
-}
-
-
-class JarvisWindow(Gtk.Window):
-    def __init__(self, assistant):
-        super().__init__(title="Jarvis")
-        self.set_default_size(440, 560)
-        self.get_style_context().add_class("jarvis")
-        provider = Gtk.CssProvider()
-        provider.load_from_data(CSS)
-        Gtk.StyleContext.add_provider_for_screen(
-            self.get_screen(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        self.connect("delete-event", lambda *_: self.hide() or True)  # close = hide
-
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        root.set_border_width(12)
-        self.add(root)
-
-        self.status_box = Gtk.Box(spacing=12)
-        self.status_box.get_style_context().add_class("status-box")
-        self.icon = Gtk.Label()
-        self.icon.get_style_context().add_class("status-icon")
-        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        self.status = Gtk.Label(xalign=0)
-        self.status.get_style_context().add_class("status-text")
-        self.sub = Gtk.Label(xalign=0)
-        self.sub.get_style_context().add_class("status-sub")
-        texts.pack_start(self.status, False, False, 0)
-        texts.pack_start(self.sub, False, False, 0)
-        self.status_box.pack_start(self.icon, False, False, 0)
-        self.status_box.pack_start(texts, True, True, 0)
-        root.pack_start(self.status_box, False, False, 0)
-
-        self.scroller = Gtk.ScrolledWindow()
-        self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.chat = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        self.scroller.add(self.chat)
-        root.pack_start(self.scroller, True, True, 0)
-
-        buttons = Gtk.Box(spacing=8, homogeneous=True)
-        talk = Gtk.Button(label="🎤 Talk")
-        stop = Gtk.Button(label="🤫 Stop talking")
-        end = Gtk.Button(label="✋ End")
-        talk.connect("clicked", lambda *_: assistant.manual_wake.set())
-        stop.connect("clicked", lambda *_: assistant.stop_speaking())
-        end.connect("clicked", lambda *_: assistant.end_conversation())
-        for b in (talk, stop, end):
-            buttons.pack_start(b, True, True, 0)
-        root.pack_start(buttons, False, False, 0)
-
-        root.show_all()
-        self.set_state("sleeping")
-
-    # Called from other threads through GLib.idle_add
-    def set_state(self, state):
-        icon, title, sub = STATES[state]
-        self.icon.set_text(icon)
-        self.status.set_text(title)
-        self.sub.set_text(sub)
-        ctx = self.status_box.get_style_context()
-        for s in STATES:
-            ctx.remove_class(s)
-        ctx.add_class(state)
-        if state != "sleeping" and not self.get_visible():
-            self.show()
-        if state == "listening":
-            self.present()
-        return False
-
-    def sleep_and_hide(self):
-        self.set_state("sleeping")
-        self.hide()
-        return False
-
-    def add_message(self, who, text):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        label_who = Gtk.Label(label="YOU" if who == "user" else "JARVIS",
-                              xalign=1 if who == "user" else 0)
-        label_who.get_style_context().add_class("who")
-        msg = Gtk.Label(label=text, xalign=0, wrap=True, selectable=True)
-        msg.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        msg.set_max_width_chars(42)
-        msg.get_style_context().add_class("bubble-user" if who == "user" else "bubble-jarvis")
-        msg.set_halign(Gtk.Align.END if who == "user" else Gtk.Align.START)
-        box.pack_start(label_who, False, False, 0)
-        box.pack_start(msg, False, False, 0)
-        self.chat.pack_start(box, False, False, 0)
-        box.show_all()
-        GLib.timeout_add(60, self._scroll_bottom)
-        return False
-
-    def add_separator(self):
-        sep = Gtk.Separator()
-        self.chat.pack_start(sep, False, False, 4)
-        sep.show()
-        return False
-
-    def _scroll_bottom(self):
-        adj = self.scroller.get_vadjustment()
-        adj.set_value(adj.get_upper())
-        return False
-
-
-# ----------------------------------------------------------------------------
 # Assistant
 # ----------------------------------------------------------------------------
 class Assistant:
@@ -428,6 +336,13 @@ class Assistant:
         self.speak_cancel = threading.Event()
         self.player = None
         self.player_lock = threading.Lock()
+        # Voice interruption: a second voice detector watches the mic while Jarvis talks
+        self.barge_vad = VAD()
+        self.barge_frames = None     # your first words, kept when you interrupt
+        # For the bubble: live microphone level and a timeline of what is being spoken
+        self.mic_level = 0.0
+        self.voice_timeline = []     # [(start, end, text, envelope, fps)]
+        self.voice_lock = threading.Lock()
         self.kokoro = None
         v = CFG["voice"]
         self.deepen = float(v["kokoro_deepen"])
@@ -485,6 +400,54 @@ class Assistant:
         self.end_requested.set()
         self.stop_speaking()
 
+    # ---------- what the bubble shows while Jarvis speaks ----------
+    PLAYBACK_LATENCY = 0.15   # seconds between writing audio and hearing it
+
+    def _timeline_reset(self):
+        with self.voice_lock:
+            self.voice_timeline = []
+
+    def _timeline_add(self, text, audio, rate):
+        """Remember when this piece will be heard and how loud it is over time."""
+        fps = 30
+        audio = np.asarray(audio, dtype=np.float32)
+        hop = max(1, int(rate / fps))
+        frames = len(audio) // hop
+        env = (np.sqrt(np.mean(audio[:frames * hop].reshape(frames, hop) ** 2, axis=1))
+               if frames else np.zeros(1))
+        env = np.clip(env / 0.12, 0, 1)
+        duration = len(audio) / rate
+        now = time.monotonic()
+        with self.voice_lock:
+            start = max(now + self.PLAYBACK_LATENCY,
+                        self.voice_timeline[-1][1] if self.voice_timeline else 0)
+            self.voice_timeline.append((start, start + duration, text, env, fps))
+
+    def _timeline_current(self):
+        now = time.monotonic()
+        with self.voice_lock:
+            for item in self.voice_timeline:
+                if item[0] <= now < item[1]:
+                    return item, now
+            if self.voice_timeline and now < self.voice_timeline[0][0]:
+                return self.voice_timeline[0], None
+        return None, now
+
+    def current_caption(self):
+        item, _ = self._timeline_current()
+        return item[2] if item else None
+
+    def voice_level(self):
+        if self.speak_cancel.is_set():
+            return 0.0
+        item, now = self._timeline_current()
+        if item is None:
+            return 0.0
+        if now is None:   # first piece not audible yet
+            return 0.0
+        start, _end, _text, env, fps = item
+        return float(env[min(len(env) - 1, int((now - start) * fps))])
+
     @staticmethod
     def _sentences(text):
         return [p.strip() for p in re.split(r"(?<=[.!?…:;])\s+", text) if p.strip()] or [text]
@@ -507,6 +470,7 @@ class Assistant:
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with self.player_lock:
             self.player = player
+        play_rate = 24000 * (1 - self.deepen)
         started = False
         try:
             for piece in self._kokoro_pieces(text):
@@ -515,6 +479,7 @@ class Assistant:
                 audio, _ = self.kokoro.create(piece, voice=self.voice_style,
                                               speed=float(v["kokoro_speed"]) / (1 - self.deepen),
                                               lang=v["kokoro_lang"])
+                self._timeline_add(piece, audio, play_rate)
                 if not started:
                     self.ui("set_state", "speaking")
                     started = True
@@ -574,7 +539,73 @@ class Assistant:
                 self._play(mp3)
             os.remove(mp3)
 
-    def speak(self, text, show=True):
+    def _fake_timeline(self, text):
+        """Edge TTS gives no samples here, so animate the orb with a gentle pulse."""
+        words = max(1, len(text.split()))
+        t = np.linspace(0, words / 2.6, int(words / 2.6 * 30) + 1)
+        env = 0.45 + 0.35 * np.abs(np.sin(t * 7))
+        now = time.monotonic()
+        with self.voice_lock:
+            self.voice_timeline = [(now, now + words / 2.6, text, env, 30)]
+
+    def _barge_monitor(self, done):
+        """Runs while Jarvis speaks. Stops him when you start talking (or say
+        "Hey Jarvis", in wakeword mode) and keeps the words you already said."""
+        ic = CFG["interrupt"]
+        mode = ic["mode"]
+        min_speech, threshold = float(ic["min_speech"]), float(ic["vad_threshold"])
+        wake_threshold = float(CFG["wake"]["threshold"])
+        self.mic.flush()
+        self.barge_vad.reset_states()
+        pre = collections.deque(maxlen=10)   # ~0.8 s of audio before the interruption
+        run, elapsed = 0.0, 0.0
+        stats = {"chunks": 0, "max_vad": 0.0, "max_rms": 0.0, "max_run": 0.0}
+        try:
+            self._barge_loop(done, mode, min_speech, threshold, wake_threshold, pre, stats)
+        finally:
+            log.info("Interrupt monitor: %d chunks, max voice score %.2f, max loudness %.0f, "
+                     "longest speech %.2fs", stats["chunks"], stats["max_vad"],
+                     stats["max_rms"], stats["max_run"])
+
+    def _barge_loop(self, done, mode, min_speech, threshold, wake_threshold, pre, stats):
+        run, elapsed = 0.0, 0.0
+        while not done.is_set():
+            try:
+                chunk = self.mic.read(timeout=0.3)
+            except queue.Empty:
+                continue
+            elapsed += STEP
+            stats["chunks"] += 1
+            stats["max_rms"] = max(stats["max_rms"], rms(chunk))
+            pre.append(chunk)
+            if elapsed < 0.3:      # ignore the very start (speaker click, own breath)
+                continue
+            if mode == "wakeword":
+                if self.wake.predict(chunk).get(WAKE_MODEL, 0.0) >= wake_threshold:
+                    log.info("Interrupted by wake word")
+                    self.wake.reset()
+                    self.barge_frames = []
+                    self.stop_speaking()
+                    return
+                continue
+            score = self.barge_vad.predict(chunk, frame_size=640)
+            stats["max_vad"] = max(stats["max_vad"], score)
+            if score > threshold:
+                run += STEP
+                stats["max_run"] = max(stats["max_run"], run)
+                if run >= min_speech:
+                    log.info("Interrupted by voice")
+                    self.barge_frames = list(pre)
+                    self.stop_speaking()
+                    return
+            else:
+                run = max(0.0, run - STEP / 2)   # tolerate tiny gaps between syllables
+
+    def _take_barge(self):
+        frames, self.barge_frames = self.barge_frames, None
+        return frames
+
+    def speak(self, text, show=True, interruptible=True):
         text = re.sub(r"[*_`#>|]", "", text).strip()
         if not text:
             return
@@ -582,25 +613,53 @@ class Assistant:
         if show:
             self.ui("add_message", "jarvis", text)
         self.speak_cancel.clear()
+        self.barge_frames = None
+        self._timeline_reset()
+        done = threading.Event()
+        monitor = None
+        if interruptible and CFG["interrupt"]["mode"] in ("voice", "wakeword"):
+            monitor = threading.Thread(target=self._barge_monitor, args=(done,), daemon=True)
+            monitor.start()
+        started_at = time.monotonic()
         try:
             if self.kokoro is None or not self._speak_kokoro(text):
+                self._fake_timeline(text)
                 self._speak_edge(text)
         finally:
-            self.mic.flush()  # do not listen to ourselves
+            log.info("Spoke for %.1fs%s", time.monotonic() - started_at,
+                     " (interrupted)" if self.speak_cancel.is_set() else "")
+            done.set()
+            if monitor:
+                monitor.join(timeout=1)
+            self._timeline_reset()
+            if self.barge_frames is None:
+                self.mic.flush()  # do not listen to ourselves
+            # if you interrupted, keep the live audio so no word is lost
 
     # ---------- listening ----------
-    def listen(self):
-        """Returns a WAV of the user's sentence, or None if nobody spoke in time."""
+    def _update_mic_level(self, chunk):
+        """0..1 loudness of your voice (log scale, smoothed) for the orb animation."""
+        db = 20 * math.log10(rms(chunk) + 1)
+        target = min(1.0, max(0.0, (db - 22) / 36))
+        self.mic_level = 0.6 * self.mic_level + 0.4 * target
+
+    def listen(self, wait_for=None, prefill=None):
+        """Returns a WAV of the user's sentence, or None if nobody spoke in time.
+        `prefill`: audio already captured when the user interrupted Jarvis."""
         lc = CFG["listening"]
-        wait_for, end_silence, max_len = (float(lc["wait_for_speech"]),
-                                          float(lc["end_silence"]), float(lc["max_utterance"]))
-        self.mic.flush()
+        wait_for = float(wait_for if wait_for is not None else lc["wait_for_speech"])
+        end_silence, max_len = float(lc["end_silence"]), float(lc["max_utterance"])
+        if not prefill:
+            self.mic.flush()
         self.vad.reset_states()
         self.ui("set_state", "listening")
         waited = 0.0
         pre = collections.deque(maxlen=6)
         while waited < wait_for:
             frames, run, started = [], 0.0, False
+            if prefill:   # you were already talking: continue recording right away
+                frames, run, started = list(prefill), MIN_SPEECH, True
+                prefill = None
             while waited < wait_for and not started:
                 if self.end_requested.is_set():
                     return None
@@ -610,6 +669,7 @@ class Assistant:
                     continue
                 waited += STEP
                 pre.append(chunk)
+                self._update_mic_level(chunk)
                 if self.vad.predict(chunk, frame_size=640) > VAD_THRESHOLD:
                     run += STEP
                     if run >= START_SPEECH:
@@ -628,6 +688,7 @@ class Assistant:
                 except queue.Empty:
                     continue
                 frames.append(chunk)
+                self._update_mic_level(chunk)
                 total += STEP
                 if self.vad.predict(chunk, frame_size=640) > VAD_THRESHOLD:
                     voiced += STEP
@@ -696,11 +757,12 @@ class Assistant:
         self._play(SOUND_WAKE)
         self.speak(p["greeting"])
         while not self.end_requested.is_set():
-            wav = self.listen()
+            # if you interrupted Jarvis, your first words are already recorded
+            wav = self.listen(prefill=self._take_barge())
             if self.end_requested.is_set():
                 break
             if wav is None:
-                self.speak(p["timeout"])
+                self.speak(p["timeout"], interruptible=False)
                 return
             self.ui("set_state", "thinking")
             try:
@@ -712,10 +774,25 @@ class Assistant:
             if not text:
                 self.speak("Sorry, I didn't catch that. Can you repeat it?")
                 continue
+            # Paused to think in the middle of a sentence? Keep listening for the rest.
+            while looks_unfinished(text) and not self.end_requested.is_set():
+                log.info("Sentence looks unfinished, waiting for the rest: %s", text)
+                more = self.listen(wait_for=float(CFG["listening"]["continue_wait"]))
+                if more is None:
+                    break
+                self.ui("set_state", "thinking")
+                try:
+                    extra = self.transcribe(more)
+                except Exception as e:
+                    log.error("Transcription failed: %s", e)
+                    break
+                if not extra:
+                    break
+                text = text.rstrip(" .…") + " " + extra
             log.info("User: %s", text)
             self.ui("add_message", "user", text)
             if is_goodbye(text):
-                self.speak(p["goodbye"])
+                self.speak(p["goodbye"], interruptible=False)
                 return
             self._play(SOUND_THINK)
             reply = self.ask_claude(text)
@@ -730,7 +807,7 @@ class Assistant:
         while True:
             if self.manual_wake.is_set():
                 self.manual_wake.clear()
-                self._run_conversation("Talk button")
+                self._run_conversation("manual wake")
                 continue
             try:
                 chunk = self.mic.read(timeout=0.5)
@@ -759,11 +836,12 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     _lock = single_instance()  # noqa: F841 (keep the lock open)
     assistant = Assistant()
-    assistant.window = JarvisWindow(assistant)
+    # `systemctl --user kill --kill-whom=main -s USR1 jarvis` wakes Jarvis (handy for a keyboard shortcut)
+    signal.signal(signal.SIGUSR1, lambda *_: assistant.manual_wake.set())
+    assistant.window = Bubble(assistant)
     if CFG["ui"]["show_on_start"]:
+        assistant.window.set_state("sleeping")
         assistant.window.show()
-    else:
-        assistant.window.hide()
     threading.Thread(target=assistant.run, daemon=True).start()
     Gtk.main()
 

@@ -49,8 +49,20 @@ threshold = 0.5
 
 [listening]
 wait_for_speech = 10.0   # seconds Jarvis waits for you to start talking
-end_silence = 1.2        # seconds of silence that end your sentence
-max_utterance = 30.0
+end_silence = 2.0        # seconds of silence that end your sentence (raise it if you
+                         # pause a lot to think, lower it for faster replies)
+max_utterance = 60.0     # maximum length of one request, in seconds
+continue_wait = 4.0      # if your sentence ends like "...and", "...because", "um",
+                         # Jarvis waits this long for you to finish it
+
+[interrupt]
+# How to cut Jarvis off while he is talking:
+#   "voice"    = just start talking (best with a headset)
+#   "wakeword" = say "Hey Jarvis" (safer with speakers, so Jarvis can't interrupt himself)
+#   "off"      = only by clicking the orb
+mode = "voice"
+min_speech = 0.30     # seconds of your voice needed to interrupt (ignores coughs)
+vad_threshold = 0.50  # how sure it must be that it's a human voice (0 to 1)
 
 [ui]
 # Show the window when Jarvis starts (otherwise it appears when you wake it up)

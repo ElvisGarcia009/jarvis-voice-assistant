@@ -22,15 +22,16 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/de
 python3 -c 'import venv, ensurepip' 2>/dev/null || missing+=("python3-venv")
 python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk' 2>/dev/null \
   || missing+=("python3-gi + GTK 3 introspection")
+python3 -c 'import gi; gi.require_foreign("cairo")' 2>/dev/null || missing+=("python3-gi-cairo")
 command -v pw-record >/dev/null || missing+=("pipewire tools (pw-record / pw-play)")
 command -v curl >/dev/null || missing+=("curl")
 command -v systemctl >/dev/null || missing+=("systemd")
 
 if [ ${#missing[@]} -gt 0 ]; then
   warn "Missing: ${missing[*]}"
-  echo "  Debian/Ubuntu/Pop!_OS: sudo apt install python3-venv python3-gi gir1.2-gtk-3.0 pipewire-bin curl"
-  echo "  Fedora:                sudo dnf install python3-gobject gtk3 pipewire-utils curl"
-  echo "  Arch:                  sudo pacman -S python-gobject gtk3 pipewire curl"
+  echo "  Debian/Ubuntu/Pop!_OS: sudo apt install python3-venv python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-gtklayershell-0.1 pipewire-bin curl"
+  echo "  Fedora:                sudo dnf install python3-gobject python3-cairo gtk3 gtk-layer-shell pipewire-utils curl"
+  echo "  Arch:                  sudo pacman -S python-gobject python-cairo gtk3 gtk-layer-shell pipewire curl"
   fail "Install the missing packages and run ./install.sh again."
 fi
 
@@ -38,6 +39,9 @@ fi
 say "Installing Jarvis into $DATA_DIR ..."
 mkdir -p "$DATA_DIR/models" "$CONFIG_DIR" "$SERVICE_DIR"
 install -m 755 "$REPO_DIR/jarvis.py" "$DATA_DIR/jarvis.py"
+install -m 644 "$REPO_DIR/jarvis_ui.py" "$DATA_DIR/jarvis_ui.py"
+python3 -c 'import gi; gi.require_version("GtkLayerShell", "0.1")' 2>/dev/null \
+  || warn "Optional: install gtk-layer-shell (gir1.2-gtklayershell-0.1) so the bubble floats above all windows."
 
 # ---------------------------------------------------------------- 3. python env
 if [ ! -x "$VENV/bin/python" ]; then
