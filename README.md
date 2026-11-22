@@ -24,22 +24,28 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 
 ## How it works
 
+```mermaid
+%%{init: {"flowchart": {"curve": "stepAfter"}, "themeVariables": {"fontFamily": "monospace"}}}%%
+flowchart LR
+    U([You]) -- "Hey Jarvis" --> W[openWakeWord]
+    W -- "wakes up" --> V[Silero VAD]
+    U -- "your request" --> V
+    V -- "audio" --> S[Whisper]
+    S -- "text" --> C[Claude Code]
+    C -- "runs commands" --> PC[Your Linux PC]
+    C <-- "session and summary" --> M[(memory.json)]
+    C -- "answer" --> T[Kokoro TTS]
+    T -- "voice" --> U
+    T -- "voice level and captions" --> B[Floating bubble]
+    U -- "talks over Jarvis" --> I[Interrupt monitor]
+    I -- "stops the voice" --> T
 ```
- microphone ──► openWakeWord ("Hey Jarvis", offline)
-                     │
-                     ▼
-              Silero VAD records your request
-                     │
-                     ▼
-              Whisper (speech → text): local faster-whisper or Groq
-                     │
-                     ▼
-              Claude Code  `claude -p --permission-mode auto`
-              (does the task on your PC, keeps the conversation)
-                     │
-                     ▼
-              Kokoro TTS (local) ──► speakers
-```
+
+- **openWakeWord** listens offline for "Hey Jarvis". Nothing leaves your PC before that.
+- **Silero VAD** records your request and waits if you pause in the middle of a sentence.
+- **Whisper** turns it into text, locally with faster-whisper (GPU or CPU) or online with Groq.
+- **Claude Code** (`claude -p --permission-mode auto`) does the task on your PC and keeps the conversation in `memory.json`, compacting it when it grows too large.
+- **Kokoro** speaks the answer locally while the **floating bubble** shows the state and captions. If you start talking, the **interrupt monitor** stops the voice and Jarvis listens.
 
 ## Requirements
 
