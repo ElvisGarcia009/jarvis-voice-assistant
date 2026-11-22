@@ -43,6 +43,30 @@ model = "sonnet"
 permission_mode = "auto"
 timeout = 300
 
+[stt]
+# How your voice becomes text:
+#   "local" = Whisper on this computer (private, offline, no account). Fast on an
+#             NVIDIA GPU; on CPU only, use local_model = "small" for speed.
+#   "groq"  = Groq's free online API (needs ~/.config/jarvis/groq_key).
+# The installer asks you which one to use. If "local" fails and a Groq key exists,
+# Jarvis falls back to Groq.
+engine = "groq"
+local_model = "large-v3-turbo"
+device = "auto"        # "auto", "cuda" or "cpu"
+language = ""          # "" = detect automatically, or force one, e.g. "en"
+
+[memory]
+# Jarvis remembers your conversations.
+enabled = true
+# Wake him up within this many hours and he continues the same conversation.
+resume_hours = 12
+# When the conversation gets bigger than this (in tokens), Jarvis summarizes it
+# after you say goodbye and starts fresh with that summary as memory.
+# This keeps answers fast and saves your Claude usage.
+max_context_tokens = 60000
+summary_model = "haiku"
+# To make Jarvis forget everything, delete ~/.local/state/jarvis/memory.json
+
 [wake]
 # Minimum score (0 to 1) to accept "Hey Jarvis". Raise it if Jarvis wakes up by mistake.
 threshold = 0.5

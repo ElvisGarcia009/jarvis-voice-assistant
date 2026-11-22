@@ -65,12 +65,53 @@ for f in kokoro-v1.0.int8.onnx voices-v1.0.bin; do
 done
 
 # ---------------------------------------------------------------- 5. config
+NEW_CONFIG=0
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
   cp "$REPO_DIR/config.example.toml" "$CONFIG_DIR/config.toml"
+  NEW_CONFIG=1
   say "Created $CONFIG_DIR/config.toml (edit it to change voice, language, name...)"
 fi
 
-if [ ! -s "$CONFIG_DIR/groq_key" ]; then
+# Read a value from the [stt] section of the config (empty if missing)
+stt_setting() {
+  python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); print(c.get("stt", {}).get(sys.argv[2], ""))' \
+    "$CONFIG_DIR/config.toml" "$1"
+}
+
+STT_ENGINE="$(stt_setting engine)"
+if [ "$NEW_CONFIG" = 1 ]; then
+  echo
+  echo "How should Jarvis turn your voice into text?"
+  echo "  1) On this computer: private, works offline, no account needed."
+  echo "     Downloads a ~1.6 GB model (plus ~2 GB of GPU libraries with an NVIDIA card)."
+  echo "  2) Online with Groq: smaller download, needs a free Groq API key."
+  read -rp "Choose 1 or 2 [1]: " STT_CHOICE
+  if [ "${STT_CHOICE:-1}" = "2" ]; then STT_ENGINE="groq"; else STT_ENGINE="local"; fi
+  # set `engine = ...` inside the [stt] section only
+  awk -v e="$STT_ENGINE" '
+    /^\[/ { in_stt = ($0 == "[stt]") }
+    in_stt && /^engine *=/ { sub(/"[^"]*"/, "\"" e "\"") }
+    { print }' "$CONFIG_DIR/config.toml" > "$CONFIG_DIR/config.toml.tmp" \
+    && mv "$CONFIG_DIR/config.toml.tmp" "$CONFIG_DIR/config.toml"
+fi
+
+if [ "$STT_ENGINE" = "local" ]; then
+  say "Installing local speech recognition (faster-whisper)..."
+  "$VENV/bin/pip" install -q faster-whisper
+  if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+    say "NVIDIA GPU found: installing CUDA libraries for fast recognition..."
+    "$VENV/bin/pip" install -q nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
+  else
+    warn "No NVIDIA GPU found: speech recognition will run on the CPU (slower)."
+    warn "For faster results on CPU, set local_model = \"small\" in [stt]."
+  fi
+  STT_MODEL="$(stt_setting local_model)"
+  say "Downloading the Whisper model (${STT_MODEL:-large-v3-turbo}), this can take a few minutes..."
+  "$VENV/bin/python" -c 'import sys; from faster_whisper import download_model; download_model(sys.argv[1])' \
+    "${STT_MODEL:-large-v3-turbo}" >/dev/null
+fi
+
+if [ "$STT_ENGINE" != "local" ] && [ ! -s "$CONFIG_DIR/groq_key" ]; then
   echo
   echo "Jarvis uses Groq (free) to turn your voice into text."
   echo "Create a key at https://console.groq.com/keys and paste it below (it stays hidden)."

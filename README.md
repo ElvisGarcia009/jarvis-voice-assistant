@@ -2,6 +2,8 @@
 
 Say **"Hey Jarvis"**, ask for something out loud, and **Claude** does it on your computer and answers with a natural voice.
 
+![Jarvis demo: you say "Hey Jarvis", ask how much free disk space you have, and the floating bubble listens, thinks and answers out loud](docs/demo.gif)
+
 Jarvis is a small Python app that connects a wake word, speech recognition and a local text-to-speech voice to [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). Claude Code is what actually acts on your PC, so Jarvis can do the same things it can: open apps, check your disk, find files, install things, explain errors, and more.
 
 > "Hey Jarvis... how much free space do I have?"
@@ -12,9 +14,10 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 - **Hands-free wake word**: "Hey Jarvis" is detected offline with [openWakeWord](https://github.com/dscripka/openWakeWord). Nothing leaves your PC until you wake it up.
 - **Real actions on your PC**: requests are handled by Claude Code in non-interactive mode, with a safety-first permission mode.
 - **Fast local voice**: [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) speaks while the rest of the answer is still being generated. You can blend voices and make them deeper. Edge TTS is available as an online alternative or fallback.
-- **Multilingual speech recognition** with Groq Whisper (free API key).
+- **Private, offline speech recognition**: Whisper runs on your own GPU or CPU with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so your voice never leaves your computer and no account is needed. On an RTX 4060 it transcribes a sentence in about half a second. Groq's free online Whisper API is available as an alternative.
 - **Interrupt by voice**: start talking while Jarvis speaks and he stops and listens, keeping your first words. With speakers instead of a headset, switch to `wakeword` mode and say "Hey Jarvis" to interrupt.
 - **Natural conversation**: keep talking without repeating the wake word. Say "thank you" (or "OK, thank you", "that's all", "gracias"...) and Jarvis goes back to sleep.
+- **Memory with automatic compaction**: wake Jarvis again within a few hours and he continues the same conversation. When it grows too large, he summarizes it into short notes and starts fresh with that memory, so answers stay fast and cheap.
 - **Language practice mode**: Jarvis can always answer in a language you are learning, and tell you how to say your request in that language when you switch to your native one.
 - **A floating bubble, not a chat window**: a translucent capsule at the bottom of the screen with an animated orb. The orb breathes while Jarvis sleeps, swells with your voice while it listens, spins while it thinks and ripples with its own voice while it speaks. Captions show what you said and the sentence Jarvis is saying right now. Click the orb to interrupt. The bubble hides itself when the conversation ends.
 - **Runs in the background** as a systemd user service and starts with your desktop.
@@ -28,7 +31,7 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
               Silero VAD records your request
                      │
                      ▼
-              Groq Whisper (speech → text)
+              Whisper (speech → text): local faster-whisper or Groq
                      │
                      ▼
               Claude Code  `claude -p --permission-mode auto`
@@ -43,7 +46,7 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 - Linux with **PipeWire** (`pw-record`, `pw-play`) and **systemd**. This covers most modern distributions.
 - **Python 3.11+** with `venv`, the **GTK 3** bindings (`python3-gi`, `python3-gi-cairo`) and, optionally, **gtk-layer-shell** so the bubble floats above other windows on Wayland.
 - **[Claude Code](https://docs.claude.com/en/docs/claude-code/overview)** installed and logged in, with a Claude subscription or API access.
-- A free **[Groq API key](https://console.groq.com/keys)** for speech recognition.
+- For speech recognition, either a little disk space for the local Whisper model (about 1.6 GB, plus about 2 GB of CUDA libraries with an NVIDIA GPU) or a free **[Groq API key](https://console.groq.com/keys)**. The installer asks which one you prefer.
 - About 500 MB of disk space for the Python packages and voice models.
 - A headset is recommended, so Jarvis does not hear itself or the people around you.
 
@@ -77,7 +80,7 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
    ./install.sh
    ```
 
-   The installer asks for your Groq API key, downloads the models, and starts Jarvis as a background service. It does not need `sudo`.
+   The installer asks how to recognize your voice (locally or with Groq), downloads the models, and starts Jarvis as a background service. It does not need `sudo`.
 
 4. Say **"Hey Jarvis"**.
 
@@ -127,8 +130,9 @@ Jarvis gives a voice interface to a tool that can run commands on your computer.
 - Anyone (or any video) near your microphone can say "Hey Jarvis". **Use a headset** and keep Jarvis off when you share the room or stream.
 - Jarvis runs Claude Code with `--permission-mode auto`, which lets Claude Code's safety classifier block risky actions. Its instructions also tell it to ask for a spoken "yes" before deleting, uninstalling or changing settings. **Do not switch to `bypassPermissions`.**
 - `sudo` does not work from Jarvis. It tells you to run those commands yourself.
+- Conversation memory (a short summary and the session id) is stored locally in `~/.local/state/jarvis/memory.json`. Delete it to make Jarvis forget.
 - Your Groq key is stored in `~/.config/jarvis/groq_key` with `600` permissions. Never commit it.
-- Audio is only sent to Groq **after** the wake word is detected. Your requests are sent to Anthropic through Claude Code, as with any Claude Code use.
+- With local speech recognition, your audio never leaves your computer. With Groq, audio is only sent **after** the wake word is detected. Your requests are sent to Anthropic through Claude Code, as with any Claude Code use.
 
 ## Troubleshooting
 
@@ -149,6 +153,7 @@ Jarvis gives a voice interface to a tool that can run commands on your computer.
 
 - Code: [MIT License](LICENSE).
 - [openWakeWord](https://github.com/dscripka/openWakeWord) (Apache-2.0). The pre-trained "hey jarvis" model is released by its author under **CC BY-NC-SA 4.0** (non-commercial). It is downloaded at install time, not distributed here.
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (MIT) with OpenAI's Whisper models (MIT).
 - [Silero VAD](https://github.com/snakers4/silero-vad) (MIT), bundled with openWakeWord.
 - [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0) through [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) (MIT).
 - [edge-tts](https://github.com/rany2/edge-tts) (LGPL-3.0), optional online voice.

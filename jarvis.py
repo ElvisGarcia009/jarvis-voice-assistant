@@ -8,7 +8,8 @@ on your computer, then answers out loud.
 Pipeline:
   1. openWakeWord listens offline for "Hey Jarvis".
   2. Silero VAD records your request until you stop talking.
-  3. Groq Whisper turns your voice into text (many languages).
+  3. Whisper turns your voice into text: locally on your GPU/CPU (faster-whisper)
+     or online with Groq (many languages).
   4. Claude Code (`claude -p`) performs the task on your PC.
   5. Kokoro (local, fast) or Edge TTS (online) speaks the answer.
   6. The conversation continues until you say "thank you" or stay silent.
@@ -62,6 +63,7 @@ STATE_DIR = os.path.join(HOME, ".local", "state", "jarvis")
 DATA_DIR = os.path.join(HOME, ".local", "share", "jarvis")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
 GROQ_KEY_FILE = os.path.join(CONFIG_DIR, "groq_key")
+MEMORY_FILE = os.path.join(HOME, ".local", "state", "jarvis", "memory.json")
 
 DEFAULTS = {
     "user": {"name": ""},
@@ -84,6 +86,18 @@ DEFAULTS = {
         "timeout": "I'll be here if you need me.",
     },
     "claude": {"model": "sonnet", "permission_mode": "auto", "timeout": 300},
+    "stt": {
+        "engine": "groq",                 # "groq" (online, free key) or "local" (offline)
+        "local_model": "large-v3-turbo",  # faster-whisper model for engine = "local"
+        "device": "auto",                 # "auto", "cuda" (NVIDIA GPU) or "cpu"
+        "language": "",                   # "" = detect automatically, or e.g. "en", "es"
+    },
+    "memory": {
+        "enabled": True,
+        "resume_hours": 12,           # wake up within this time = same conversation
+        "max_context_tokens": 60000,  # bigger than this = summarize and start fresh
+        "summary_model": "haiku",     # model used to write the summary
+    },
     "wake": {"threshold": 0.5},
     "listening": {"wait_for_speech": 10.0, "end_silence": 2.0, "max_utterance": 60.0,
                   "continue_wait": 4.0},
@@ -328,7 +342,14 @@ class Assistant:
         self.vad = VAD()
         self.mic = Microphone()
         self.session = None
+        self.memory = {}
         self.groq_key = self._load_groq_key()
+        self.local_stt = None
+        self.local_stt_ready = threading.Event()
+        if CFG["stt"]["engine"] == "local":
+            threading.Thread(target=self._load_local_stt, daemon=True).start()
+        else:
+            self.local_stt_ready.set()
         self.system_prompt = build_system_prompt()
         self.window = None
         self.manual_wake = threading.Event()
@@ -366,11 +387,61 @@ class Assistant:
         key = os.environ.get("GROQ_API_KEY", "").strip()
         if not key and os.path.exists(GROQ_KEY_FILE):
             key = open(GROQ_KEY_FILE).read().strip()
-        if key:
-            return key
+        if key or CFG["stt"]["engine"] == "local":
+            return key or None   # with local speech recognition the key is only a fallback
         log.error("Missing Groq API key in %s", GROQ_KEY_FILE)
         notify("Jarvis", "Missing Groq API key. Run install.sh again.")
         sys.exit(1)
+
+    # ---------- local speech recognition (faster-whisper, offline) ----------
+    @staticmethod
+    def _preload_cuda_libs():
+        """faster-whisper needs cuBLAS and cuDNN. When they come from the pip
+        packages nvidia-cublas-cu12 / nvidia-cudnn-cu12, load them by hand."""
+        import ctypes
+        import importlib.util
+        spec = importlib.util.find_spec("nvidia")
+        if not spec or not spec.submodule_search_locations:
+            return
+        base = list(spec.submodule_search_locations)[0]
+        for pattern in ("cublas/lib/libcublasLt.so.*", "cublas/lib/libcublas.so.*",
+                        "cudnn/lib/libcudnn*.so.*"):
+            for lib in sorted(glob.glob(os.path.join(base, pattern))):
+                try:
+                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+
+    def _load_local_stt(self):
+        """Loads the Whisper model once (in the background, at startup)."""
+        sc = CFG["stt"]
+        try:
+            self._preload_cuda_libs()
+            import ctranslate2
+            from faster_whisper import WhisperModel
+            device = sc["device"]
+            if device == "auto":
+                device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+            compute = "float16" if device == "cuda" else "int8"
+            started = time.monotonic()
+            self.local_stt = WhisperModel(sc["local_model"], device=device, compute_type=compute)
+            self.local_stt.transcribe(np.zeros(RATE, np.float32))   # warm up
+            log.info("Local speech recognition ready (%s on %s, %.1fs)",
+                     sc["local_model"], device, time.monotonic() - started)
+        except Exception as e:
+            self.local_stt = None
+            log.error("Local speech recognition unavailable: %s%s", e,
+                      " (falling back to Groq)" if self.groq_key else "")
+        finally:
+            self.local_stt_ready.set()
+
+    def _transcribe_local(self, wav):
+        with wave.open(io.BytesIO(wav)) as w:
+            audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
+        language = CFG["stt"]["language"].strip() or None
+        segments, _info = self.local_stt.transcribe(
+            audio, beam_size=1, language=language, condition_on_previous_text=False)
+        return " ".join(s.text.strip() for s in segments).strip()
 
     def ui(self, method, *args):
         if self.window:
@@ -709,36 +780,129 @@ class Assistant:
         return None
 
     def transcribe(self, wav):
-        r = requests.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {self.groq_key}"},
-            files={"file": ("audio.wav", wav, "audio/wav")},
-            data={"model": "whisper-large-v3-turbo", "temperature": "0",
-                  "response_format": "json"},
-            timeout=30)
-        r.raise_for_status()
-        text = r.json().get("text", "").strip()
+        text = None
+        if CFG["stt"]["engine"] == "local":
+            self.local_stt_ready.wait(timeout=120)   # first use right after startup
+            if self.local_stt is not None:
+                try:
+                    text = self._transcribe_local(wav)
+                except Exception as e:
+                    log.error("Local transcription failed: %s", e)
+            if text is None and not self.groq_key:
+                raise RuntimeError("Local speech recognition is not working and there is no Groq key")
+        if text is None:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {self.groq_key}"},
+                files={"file": ("audio.wav", wav, "audio/wav")},
+                data={"model": "whisper-large-v3-turbo", "temperature": "0",
+                      "response_format": "json"},
+                timeout=30)
+            r.raise_for_status()
+            text = r.json().get("text", "").strip()
         if any(h in normalize(text) for h in HALLUCINATIONS):
             return ""
         return text
 
+    # ---------- memory between conversations ----------
+    # memory.json = {"session_id", "last_used", "context_tokens", "summary"}
+    def _load_memory(self):
+        try:
+            with open(MEMORY_FILE) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_memory(self, mem):
+        tmp = MEMORY_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(mem, f, indent=2, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, MEMORY_FILE)
+
+    def _resume_session(self):
+        """Continue the previous Claude session if it was used recently."""
+        mc = CFG["memory"]
+        self.memory = self._load_memory() if mc["enabled"] else {}
+        last = self.memory.get("last_used", 0)
+        if self.memory.get("session_id") and time.time() - last < float(mc["resume_hours"]) * 3600:
+            self.session = self.memory["session_id"]
+            log.info("Continuing previous conversation (%s tokens of context)",
+                     self.memory.get("context_tokens", "?"))
+        else:
+            self.session = None
+
+    def _system_prompt_with_memory(self):
+        summary = self.memory.get("summary", "").strip() if CFG["memory"]["enabled"] else ""
+        if not summary:
+            return self.system_prompt
+        return (self.system_prompt + "\n\nMEMORY FROM EARLIER CONVERSATIONS (use it when relevant, "
+                "do not read it aloud):\n" + summary)
+
+    def _run_claude(self, text, model, session, system_prompt):
+        c = CFG["claude"]
+        cmd = [claude_binary(), "-p", text, "--output-format", "json",
+               "--model", model, "--permission-mode", c["permission_mode"],
+               "--append-system-prompt", system_prompt]
+        if session:
+            cmd += ["--resume", session]
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=int(c["timeout"]), cwd=HOME)
+        try:
+            return json.loads(out.stdout), out
+        except json.JSONDecodeError:
+            return None, out
+
+    @staticmethod
+    def _context_tokens(data):
+        """How big the conversation is now, from Claude Code's usage report.
+        A reply with tools makes several API calls and `usage` adds them all up,
+        so use the LAST call: its input is the whole conversation so far."""
+        u = data.get("usage") or {}
+        calls = u.get("iterations") or []
+        last = calls[-1] if calls and isinstance(calls[-1], dict) else u
+        return sum(int(last.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                   "cache_read_input_tokens", "output_tokens"))
+
+    def compact_memory(self):
+        """Summarize the long conversation, then start fresh with that summary as memory."""
+        if not self.memory.get("session_id"):
+            return
+        log.info("Conversation is large (%s tokens): summarizing it...",
+                 self.memory.get("context_tokens"))
+        request = ("Write private notes for your future self about what you LEARNED in our "
+                   "conversations: facts about the user and their computer, their preferences, "
+                   "decisions, and anything still pending. Merge the earlier memory if there is "
+                   "one. Do NOT repeat your instructions, rules or how you should answer; you "
+                   "will get those again. At most 10 short lines, plain text, no tools. If "
+                   "nothing worth remembering happened, answer exactly: (nothing)")
+        try:
+            data, out = self._run_claude(request, CFG["memory"]["summary_model"],
+                                         self.memory["session_id"],
+                                         self._system_prompt_with_memory())
+        except subprocess.TimeoutExpired:
+            data = None
+        if not data or data.get("is_error") or not (data.get("result") or "").strip():
+            log.error("Could not summarize the conversation; keeping it as is")
+            return
+        summary = data["result"].strip()
+        if summary == "(nothing)":
+            summary = self.memory.get("summary", "")
+        self.memory = {"summary": summary, "session_id": None,
+                       "last_used": time.time(), "context_tokens": 0}
+        self._save_memory(self.memory)
+        log.info("Memory compacted. New summary:\n%s", self.memory["summary"])
+
     # ---------- Claude ----------
     def ask_claude(self, text):
         c = CFG["claude"]
-        cmd = [claude_binary(), "-p", text, "--output-format", "json",
-               "--model", c["model"], "--permission-mode", c["permission_mode"],
-               "--append-system-prompt", self.system_prompt]
-        if self.session:
-            cmd += ["--resume", self.session]
         log.info("Asking Claude: %s", text)
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=int(c["timeout"]), cwd=HOME)
+            data, out = self._run_claude(text, c["model"], self.session,
+                                         self._system_prompt_with_memory())
         except subprocess.TimeoutExpired:
             return "That is taking too long. It's better to do it directly in Claude Code."
-        try:
-            data = json.loads(out.stdout)
-        except json.JSONDecodeError:
+        if data is None:
             log.error("Unexpected Claude output: %s %s", out.stdout[-500:], out.stderr[-500:])
             if "login" in (out.stdout + out.stderr).lower():
                 return "I'm not logged in to Claude. Run claude auth login in a terminal."
@@ -746,12 +910,16 @@ class Assistant:
         self.session = data.get("session_id") or self.session
         if data.get("is_error"):
             log.error("Claude returned an error: %s", str(data)[:500])
+        if CFG["memory"]["enabled"]:
+            self.memory.update({"session_id": self.session, "last_used": time.time(),
+                                "context_tokens": self._context_tokens(data)})
+            self._save_memory(self.memory)
         return (data.get("result") or "").strip() or "Done."
 
     # ---------- conversation ----------
     def conversation(self):
         p = CFG["phrases"]
-        self.session = None
+        self._resume_session()
         self.end_requested.clear()
         self.ui("add_separator")
         self._play(SOUND_WAKE)
@@ -828,6 +996,13 @@ class Assistant:
         self.wake.reset()
         self.mic.flush()
         self.ui("sleep_and_hide")
+        # auto-compact after the conversation, so it never delays an answer
+        mc = CFG["memory"]
+        if mc["enabled"] and self.memory.get("context_tokens", 0) > int(mc["max_context_tokens"]):
+            try:
+                self.compact_memory()
+            except Exception as e:
+                log.exception("Memory compaction failed: %s", e)
         log.info("Waiting for 'Hey Jarvis'...")
 
 
