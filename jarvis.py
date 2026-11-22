@@ -450,7 +450,7 @@ class Assistant:
 
     @staticmethod
     def _sentences(text):
-        return [p.strip() for p in re.split(r"(?<=[.!?…:;])\s+", text) if p.strip()] or [text]
+        return [p.strip() for p in re.split(r"(?<=[.!?…:;])\s+|(?<=[.!?…][\"”'’])\s+", " ".join(text.split())) if p.strip()] or [text]
 
     def _kokoro_pieces(self, text):
         """First piece is short (up to the first comma) so speech starts sooner."""
