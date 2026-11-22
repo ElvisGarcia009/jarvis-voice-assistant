@@ -1,0 +1,14 @@
+# Never commit secrets
+groq_key
+*.key
+.env
+
+# Local runtime files
+venv/
+.venv/
+__pycache__/
+*.pyc
+models/
+*.onnx
+*.bin
+*.log

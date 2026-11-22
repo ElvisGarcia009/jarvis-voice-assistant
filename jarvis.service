@@ -1,0 +1,14 @@
+[Unit]
+Description=Jarvis Voice Assistant (Hey Jarvis + Claude Code)
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.claude/local:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/share/jarvis/venv/bin/python -u %h/.local/share/jarvis/jarvis.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

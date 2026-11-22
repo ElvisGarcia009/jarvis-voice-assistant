@@ -1,0 +1,57 @@
+# Jarvis settings. The installer copies this file to ~/.config/jarvis/config.toml
+# After editing it, restart Jarvis:  systemctl --user restart jarvis
+
+[user]
+# How Jarvis calls you (leave empty for "the user")
+name = ""
+
+[language]
+# "auto" = Jarvis answers in the language you speak.
+# Or force a language, e.g. "English" or "Spanish".
+reply = "auto"
+# Language practice mode: if `reply` is a fixed language and you speak in this
+# language, Jarvis first tells you how to say your sentence in `reply`.
+# Example: reply = "English", tutor = "Spanish"
+tutor = ""
+
+[voice]
+# "kokoro" = local voice, fast and offline (recommended)
+# "edge"   = Microsoft Edge online voices (many languages, slower, needs internet)
+engine = "kokoro"
+# Kokoro voices: am_onyx, am_michael, am_fenrir, am_puck, am_liam, af_heart, af_bella,
+# bm_george, bf_emma, ... Join several with "+" to blend them.
+kokoro_voice = "am_onyx+am_michael"
+kokoro_speed = 1.15
+# 0 = normal pitch, 0.08 = 8% deeper (a "butler" voice)
+kokoro_deepen = 0.08
+# Kokoro language: "en-us", "en-gb", "es", "fr-fr", "it", "pt-br", "hi", "ja", "zh"
+kokoro_lang = "en-us"
+# Edge voice (used when engine = "edge", and as a fallback)
+edge_voice = "en-US-AndrewMultilingualNeural"
+
+[phrases]
+greeting = "Yes? What can I do for you?"
+goodbye = "You're welcome. I'll be here if you need me."
+timeout = "I'll be here if you need me."
+
+[claude]
+# Claude model alias used by Claude Code: "sonnet" is fast for voice, "opus" is smarter
+model = "sonnet"
+# Claude Code permission mode. "auto" lets Claude Code's safety classifier decide
+# what is allowed. Avoid "bypassPermissions": anyone near your microphone could
+# ask Jarvis to do anything.
+permission_mode = "auto"
+timeout = 300
+
+[wake]
+# Minimum score (0 to 1) to accept "Hey Jarvis". Raise it if Jarvis wakes up by mistake.
+threshold = 0.5
+
+[listening]
+wait_for_speech = 10.0   # seconds Jarvis waits for you to start talking
+end_silence = 1.2        # seconds of silence that end your sentence
+max_utterance = 30.0
+
+[ui]
+# Show the window when Jarvis starts (otherwise it appears when you wake it up)
+show_on_start = false

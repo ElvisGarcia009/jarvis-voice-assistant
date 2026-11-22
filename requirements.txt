@@ -1,0 +1,10 @@
+numpy
+requests
+onnxruntime
+scipy
+scikit-learn
+tqdm
+edge-tts
+kokoro-onnx
+# openwakeword is installed separately with --no-deps (see install.sh), because its
+# Linux package metadata requires tflite-runtime, which has no wheels for Python 3.12+.
