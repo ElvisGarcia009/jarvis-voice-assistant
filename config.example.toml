@@ -53,7 +53,16 @@ timeout = 300
 engine = "groq"
 local_model = "large-v3-turbo"
 device = "auto"        # "auto", "cuda" or "cpu"
+compute_type = "auto"  # "auto" = int8_float16 on GPU (about 1.1 GB of VRAM), int8 on CPU
 language = ""          # "" = detect automatically, or force one, e.g. "en"
+# The model loads when you say "Hey Jarvis" (while Jarvis greets you) and is freed
+# this many seconds after the conversation, so a sleeping Jarvis uses no VRAM.
+# -1 keeps it loaded all the time (no loading wait, but the VRAM stays busy).
+unload_after = 60
+# Gaming mode: while ~/.local/state/jarvis/gaming_mode exists, Whisper runs on the
+# CPU with this smaller model and the GPU stays free for games. Ask Jarvis to
+# "turn on gaming mode", or: touch ~/.local/state/jarvis/gaming_mode
+gaming_model = "small"
 
 [memory]
 # Jarvis remembers your conversations.

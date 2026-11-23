@@ -34,6 +34,7 @@ import logging
 import os
 import queue
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -64,6 +65,9 @@ DATA_DIR = os.path.join(HOME, ".local", "share", "jarvis")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.toml")
 GROQ_KEY_FILE = os.path.join(CONFIG_DIR, "groq_key")
 MEMORY_FILE = os.path.join(HOME, ".local", "state", "jarvis", "memory.json")
+# While this file exists, speech recognition stays off the GPU (to leave all VRAM to games)
+GAMING_FLAG = os.path.join(STATE_DIR, "gaming_mode")
+STT_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_stt.py")
 
 DEFAULTS = {
     "user": {"name": ""},
@@ -90,7 +94,11 @@ DEFAULTS = {
         "engine": "groq",                 # "groq" (online, free key) or "local" (offline)
         "local_model": "large-v3-turbo",  # faster-whisper model for engine = "local"
         "device": "auto",                 # "auto", "cuda" (NVIDIA GPU) or "cpu"
+        "compute_type": "auto",           # "auto" = int8_float16 on GPU, int8 on CPU
         "language": "",                   # "" = detect automatically, or e.g. "en", "es"
+        "unload_after": 60,               # seconds after a conversation to free the model
+                                          # (and all GPU memory); -1 = keep it loaded
+        "gaming_model": "small",          # model used on the CPU while gaming mode is on
     },
     "memory": {
         "enabled": True,
@@ -290,6 +298,11 @@ HOW TO ACT:
   changing system settings, sending messages, buying something), do NOT do it yet: say what
   you will do and ask {who} to confirm with "yes". Only do it after the confirmation.
 - If you are not sure what {who} wants, ask in one sentence.
+
+GAMING MODE (keeps your speech recognition off the graphics card so games get all the VRAM):
+- Turn it on with: touch {GAMING_FLAG}
+- Turn it off with: rm -f {GAMING_FLAG}
+- It is on if that file exists. It only changes how you hear {who}, not how you answer.
 """.strip()
 
 
@@ -332,6 +345,126 @@ class Microphone:
 
 
 # ----------------------------------------------------------------------------
+# Local speech recognition (faster-whisper in a child process, see jarvis_stt.py)
+# ----------------------------------------------------------------------------
+def gaming_mode():
+    return os.path.exists(GAMING_FLAG)
+
+
+class LocalSTT:
+    """Starts the Whisper worker when Jarvis wakes up and stops it a while after
+    the conversation. Only ending the process frees all GPU memory (CUDA context
+    included), so while Jarvis sleeps it uses no VRAM."""
+
+    def __init__(self):
+        self.proc = None
+        self.spec = None             # (model, device, compute) of the running worker
+        self.ready = threading.Event()
+        self.error = None
+        self.lock = threading.RLock()
+        self.timer = None
+
+    @staticmethod
+    def wanted():
+        sc = CFG["stt"]
+        if gaming_mode():
+            return (sc["gaming_model"], "cpu", "int8")
+        return (sc["local_model"], sc["device"], sc["compute_type"])
+
+    def load(self):
+        """Starts loading in the background (no-op if the right model is running)."""
+        with self.lock:
+            self._cancel_timer()
+            spec = self.wanted()
+            if self.proc and self.proc.poll() is None and self.spec == spec:
+                return
+            self._stop()
+            self.spec, self.error = spec, None
+            self.ready.clear()
+            self.proc = subprocess.Popen([sys.executable, STT_WORKER, *spec],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            threading.Thread(target=self._wait_ready, args=(self.proc,), daemon=True).start()
+
+    def _wait_ready(self, proc):
+        line = proc.stdout.readline()
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            msg = {"error": "the worker stopped while loading"}
+        with self.lock:
+            if proc is not self.proc:
+                return
+            if "error" in msg:
+                self.error = msg["error"]
+                log.error("Local speech recognition unavailable: %s", self.error)
+            else:
+                log.info("Local speech recognition loaded (%s on %s, %s, %.1fs)",
+                         msg["model"], msg["device"], msg["compute"], msg["seconds"])
+            self.ready.set()
+
+    def transcribe(self, audio, language=None):
+        self.load()
+        if not self.ready.wait(timeout=120):
+            raise RuntimeError("the speech model took too long to load")
+        with self.lock:
+            proc = self.proc
+            if self.error or proc is None:
+                raise RuntimeError(self.error or "the speech model was unloaded")
+            request = json.dumps({"samples": len(audio), "language": language}) + "\n"
+            try:
+                proc.stdin.write(request.encode())
+                proc.stdin.write(np.asarray(audio, np.float32).tobytes())
+                proc.stdin.flush()
+                readable, _, _ = select.select([proc.stdout], [], [], 60)
+                line = proc.stdout.readline() if readable else b""
+            except (BrokenPipeError, OSError) as e:
+                line = b""
+                log.error("Speech worker pipe error: %s", e)
+            if not line:
+                self._stop()
+                raise RuntimeError("the speech worker stopped responding")
+            msg = json.loads(line)
+            if "error" in msg:
+                raise RuntimeError(msg["error"])
+            return msg["text"]
+
+    def unload_later(self, seconds):
+        """Frees the model after `seconds` (0 = now, negative = never)."""
+        with self.lock:
+            self._cancel_timer()
+            if self.proc is None or seconds < 0:
+                return
+            if seconds == 0 or (gaming_mode() and self.spec and self.spec[1] != "cpu"):
+                self._stop()
+                return
+            self.timer = threading.Timer(seconds, self.unload)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def unload(self):
+        with self.lock:
+            self._stop()
+
+    def _cancel_timer(self):
+        if self.timer:
+            self.timer.cancel()
+            self.timer = None
+
+    def _stop(self):
+        proc, self.proc, self.spec = self.proc, None, None
+        self.ready.clear()
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()        # the worker exits when its input closes
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            proc.wait()
+        log.info("Local speech recognition unloaded (memory freed)")
+
+
+# ----------------------------------------------------------------------------
 # Assistant
 # ----------------------------------------------------------------------------
 class Assistant:
@@ -344,12 +477,8 @@ class Assistant:
         self.session = None
         self.memory = {}
         self.groq_key = self._load_groq_key()
-        self.local_stt = None
-        self.local_stt_ready = threading.Event()
-        if CFG["stt"]["engine"] == "local":
-            threading.Thread(target=self._load_local_stt, daemon=True).start()
-        else:
-            self.local_stt_ready.set()
+        # loaded on demand when Jarvis wakes up, freed after the conversation
+        self.stt = LocalSTT() if CFG["stt"]["engine"] == "local" else None
         self.system_prompt = build_system_prompt()
         self.window = None
         self.manual_wake = threading.Event()
@@ -394,54 +523,16 @@ class Assistant:
         sys.exit(1)
 
     # ---------- local speech recognition (faster-whisper, offline) ----------
-    @staticmethod
-    def _preload_cuda_libs():
-        """faster-whisper needs cuBLAS and cuDNN. When they come from the pip
-        packages nvidia-cublas-cu12 / nvidia-cudnn-cu12, load them by hand."""
-        import ctypes
-        import importlib.util
-        spec = importlib.util.find_spec("nvidia")
-        if not spec or not spec.submodule_search_locations:
-            return
-        base = list(spec.submodule_search_locations)[0]
-        for pattern in ("cublas/lib/libcublasLt.so.*", "cublas/lib/libcublas.so.*",
-                        "cudnn/lib/libcudnn*.so.*"):
-            for lib in sorted(glob.glob(os.path.join(base, pattern))):
-                try:
-                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
-                except OSError:
-                    pass
-
-    def _load_local_stt(self):
-        """Loads the Whisper model once (in the background, at startup)."""
-        sc = CFG["stt"]
-        try:
-            self._preload_cuda_libs()
-            import ctranslate2
-            from faster_whisper import WhisperModel
-            device = sc["device"]
-            if device == "auto":
-                device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-            compute = "float16" if device == "cuda" else "int8"
-            started = time.monotonic()
-            self.local_stt = WhisperModel(sc["local_model"], device=device, compute_type=compute)
-            self.local_stt.transcribe(np.zeros(RATE, np.float32))   # warm up
-            log.info("Local speech recognition ready (%s on %s, %.1fs)",
-                     sc["local_model"], device, time.monotonic() - started)
-        except Exception as e:
-            self.local_stt = None
-            log.error("Local speech recognition unavailable: %s%s", e,
-                      " (falling back to Groq)" if self.groq_key else "")
-        finally:
-            self.local_stt_ready.set()
-
     def _transcribe_local(self, wav):
         with wave.open(io.BytesIO(wav)) as w:
             audio = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
-        language = CFG["stt"]["language"].strip() or None
-        segments, _info = self.local_stt.transcribe(
-            audio, beam_size=1, language=language, condition_on_previous_text=False)
-        return " ".join(s.text.strip() for s in segments).strip()
+        started = time.monotonic()
+        self.stt.load()   # restarts the worker if gaming mode changed
+        loading = not self.stt.ready.is_set()
+        text = self.stt.transcribe(audio, CFG["stt"]["language"].strip() or None)
+        log.info("Transcribed locally in %.2fs%s", time.monotonic() - started,
+                 " (including waiting for the model to load)" if loading else "")
+        return text
 
     def ui(self, method, *args):
         if self.window:
@@ -781,13 +872,12 @@ class Assistant:
 
     def transcribe(self, wav):
         text = None
-        if CFG["stt"]["engine"] == "local":
-            self.local_stt_ready.wait(timeout=120)   # first use right after startup
-            if self.local_stt is not None:
-                try:
-                    text = self._transcribe_local(wav)
-                except Exception as e:
-                    log.error("Local transcription failed: %s", e)
+        if self.stt:
+            try:
+                text = self._transcribe_local(wav)
+            except Exception as e:
+                log.error("Local transcription failed: %s%s", e,
+                          " (falling back to Groq)" if self.groq_key else "")
             if text is None and not self.groq_key:
                 raise RuntimeError("Local speech recognition is not working and there is no Groq key")
         if text is None:
@@ -987,6 +1077,8 @@ class Assistant:
 
     def _run_conversation(self, why):
         log.info("Wake up (%s)", why)
+        if self.stt:
+            self.stt.load()   # loads while Jarvis greets you and you speak
         try:
             self.conversation()
         except Exception as e:
@@ -996,6 +1088,8 @@ class Assistant:
         self.wake.reset()
         self.mic.flush()
         self.ui("sleep_and_hide")
+        if self.stt:
+            self.stt.unload_later(float(CFG["stt"]["unload_after"]))
         # auto-compact after the conversation, so it never delays an answer
         mc = CFG["memory"]
         if mc["enabled"] and self.memory.get("context_tokens", 0) > int(mc["max_context_tokens"]):

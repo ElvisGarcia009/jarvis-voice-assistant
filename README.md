@@ -14,7 +14,8 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 - **Hands-free wake word**: "Hey Jarvis" is detected offline with [openWakeWord](https://github.com/dscripka/openWakeWord). Nothing leaves your PC until you wake it up.
 - **Real actions on your PC**: requests are handled by Claude Code in non-interactive mode, with a safety-first permission mode.
 - **Fast local voice**: [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) speaks while the rest of the answer is still being generated. You can blend voices and make them deeper. Edge TTS is available as an online alternative or fallback.
-- **Private, offline speech recognition**: Whisper runs on your own GPU or CPU with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so your voice never leaves your computer and no account is needed. On an RTX 4060 it transcribes a sentence in about half a second. Groq's free online Whisper API is available as an alternative.
+- **Private, offline speech recognition**: Whisper runs on your own GPU or CPU with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so your voice never leaves your computer and no account is needed. On an RTX 4060 it transcribes a sentence in under half a second. Groq's free online Whisper API is available as an alternative.
+- **Leaves your GPU to your games**: the Whisper model (int8, about 1.1 GB of VRAM) only loads when you say "Hey Jarvis" and is freed a minute after the conversation, so a sleeping Jarvis uses no VRAM. Say "turn on gaming mode" and speech recognition moves to the CPU while you play.
 - **Interrupt by voice**: start talking while Jarvis speaks and he stops and listens, keeping your first words. With speakers instead of a headset, switch to `wakeword` mode and say "Hey Jarvis" to interrupt.
 - **Natural conversation**: keep talking without repeating the wake word. Say "thank you" (or "OK, thank you", "that's all", "gracias"...) and Jarvis goes back to sleep.
 - **Memory with automatic compaction**: wake Jarvis again within a few hours and he continues the same conversation. When it grows too large, he summarizes it into short notes and starts fresh with that memory, so answers stay fast and cheap.
@@ -43,7 +44,7 @@ flowchart LR
 
 - **openWakeWord** listens offline for "Hey Jarvis". Nothing leaves your PC before that.
 - **Silero VAD** records your request and waits if you pause in the middle of a sentence.
-- **Whisper** turns it into text, locally with faster-whisper (GPU or CPU) or online with Groq.
+- **Whisper** turns it into text, locally with faster-whisper (GPU or CPU) or online with Groq. The local model runs in a child process that starts when Jarvis wakes up and ends after the conversation, freeing all of its memory.
 - **Claude Code** (`claude -p --permission-mode auto`) does the task on your PC and keeps the conversation in `memory.json`, compacting it when it grows too large.
 - **Kokoro** speaks the answer locally while the **floating bubble** shows the state and captions. If you start talking, the **interrupt monitor** stops the voice and Jarvis listens.
 
@@ -98,6 +99,7 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
 | Ask something | Just talk after the greeting |
 | Interrupt | Just start talking (or say "Hey Jarvis" in `wakeword` mode), click the orb, or the ■ button |
 | Finish | Say "thank you" / "OK, thank you" / "that's all", stay silent, or click ✕ |
+| Gaming mode | Say "turn on gaming mode" / "turn off gaming mode", or `touch` / `rm` `~/.local/state/jarvis/gaming_mode` |
 
 Service commands:
 

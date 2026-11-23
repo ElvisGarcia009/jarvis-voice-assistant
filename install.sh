@@ -40,6 +40,7 @@ say "Installing Jarvis into $DATA_DIR ..."
 mkdir -p "$DATA_DIR/models" "$CONFIG_DIR" "$SERVICE_DIR"
 install -m 755 "$REPO_DIR/jarvis.py" "$DATA_DIR/jarvis.py"
 install -m 644 "$REPO_DIR/jarvis_ui.py" "$DATA_DIR/jarvis_ui.py"
+install -m 644 "$REPO_DIR/jarvis_stt.py" "$DATA_DIR/jarvis_stt.py"
 python3 -c 'import gi; gi.require_version("GtkLayerShell", "0.1")' 2>/dev/null \
   || warn "Optional: install gtk-layer-shell (gir1.2-gtklayershell-0.1) so the bubble floats above all windows."
 
@@ -106,9 +107,10 @@ if [ "$STT_ENGINE" = "local" ]; then
     warn "For faster results on CPU, set local_model = \"small\" in [stt]."
   fi
   STT_MODEL="$(stt_setting local_model)"
-  say "Downloading the Whisper model (${STT_MODEL:-large-v3-turbo}), this can take a few minutes..."
-  "$VENV/bin/python" -c 'import sys; from faster_whisper import download_model; download_model(sys.argv[1])' \
-    "${STT_MODEL:-large-v3-turbo}" >/dev/null
+  GAMING_MODEL="$(stt_setting gaming_model)"
+  say "Downloading the Whisper models (${STT_MODEL:-large-v3-turbo}, and ${GAMING_MODEL:-small} for gaming mode)..."
+  "$VENV/bin/python" -c 'import sys; from faster_whisper import download_model; [download_model(m) for m in sys.argv[1:]]' \
+    "${STT_MODEL:-large-v3-turbo}" "${GAMING_MODEL:-small}" >/dev/null
 fi
 
 if [ "$STT_ENGINE" != "local" ] && [ ! -s "$CONFIG_DIR/groq_key" ]; then
