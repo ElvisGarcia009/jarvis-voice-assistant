@@ -4,10 +4,11 @@
 
 ## Files
 
-- `jarvis.py` — the pipeline and the `Assistant` class: microphone (`pw-record`), wake word (openWakeWord `hey_jarvis`), Silero VAD listening, transcription (`[stt] engine`: local faster-whisper through `LocalSTT`, or Groq; local falls back to Groq if a key exists), Claude Code calls (`claude -p --output-format json --permission-mode auto --resume <session>`), Kokoro/Edge TTS, voice interruption (`_barge_monitor`), goodbye and unfinished-sentence detection, memory between conversations (`_resume_session`, `compact_memory`: resume the Claude session within `resume_hours`; after a conversation whose context exceeds `max_context_tokens`, summarize it with `summary_model` and start fresh with the summary appended to the system prompt).
+- `jarvis.py` — the pipeline and the `Assistant` class: microphone (`pw-record`), wake word (openWakeWord `hey_jarvis` through `WakeDetector`: `[wake] patience` chunks in a row, stricter `media_threshold` while `MediaWatch` sees media playing via `playerctl`, near misses logged), Silero VAD listening, transcription (`[stt] engine`: local faster-whisper through `LocalSTT`, or Groq; local falls back to Groq if a key exists), Claude Code calls (`ask_and_speak`: `claude -p --output-format stream-json --verbose --include-partial-messages --permission-mode auto --resume <session>` read line by line in a thread; `SentenceStream` hands each finished sentence to the TTS; `[phrases] working` is said on the first tool use if nothing was said yet; ✕ / orb-while-thinking sets `end_requested` and `_stop_claude` kills Claude's whole process group; `compact_memory` still uses the non-streaming `_run_claude`), Kokoro/Edge TTS, voice interruption (`_barge_monitor`), goodbye and unfinished-sentence detection, memory between conversations (`_resume_session`, `compact_memory`: resume the Claude session within `resume_hours`; after a conversation whose context exceeds `max_context_tokens`, summarize it with `summary_model` and start fresh with the summary appended to the system prompt).
 - `jarvis_stt.py` — the local Whisper worker. `LocalSTT` in `jarvis.py` starts it as a child process on wake (`load()`, so loading overlaps the greeting), talks to it over stdin/stdout (JSON line + float32 samples), and stops it `unload_after` seconds after the conversation (`unload_later()`). Gaming mode (`~/.local/state/jarvis/gaming_mode` exists) runs `gaming_model` on the CPU instead.
 - `jarvis_ui.py` — the floating bubble (`Bubble`): transparent window pinned with gtk-layer-shell (falls back to keep-above), everything drawn with Cairo + Pango. It reads `assistant.mic_level`, `assistant.voice_level()` and `assistant.current_caption()`.
 - `install.sh` / `uninstall.sh` — per-user install into `~/.local/share/jarvis` (venv with `--system-site-packages` for GTK), models, Groq key prompt, systemd unit.
+- `benchmark.py` — resource measurements (dev tool, not installed): `monitor` samples the service's cgroup (CPU, PSS RAM, VRAM per activity, Claude and its commands included); `components` times Kokoro, both Whisper models and, with `--claude`, one real request. Update the README "Resource usage" table when the numbers change.
 - `config.example.toml` — every setting with comments. Defaults live in `DEFAULTS` in `jarvis.py`; keep both in sync.
 
 ## Runtime locations
@@ -20,7 +21,9 @@
 ## Develop and test
 
 ```bash
-python3 -m py_compile jarvis.py jarvis_ui.py          # syntax check
+python3 -m py_compile jarvis.py jarvis_ui.py jarvis_stt.py   # syntax check
+~/.local/share/jarvis/venv/bin/python -m pytest tests       # tests (once: venv/bin/pip install pytest)
+python3 benchmark.py monitor 60                              # CPU/RAM/VRAM of the running service
 install -m 755 jarvis.py ~/.local/share/jarvis/        # deploy without the full installer
 install -m 644 jarvis_ui.py jarvis_stt.py ~/.local/share/jarvis/
 systemctl --user restart jarvis
@@ -29,18 +32,21 @@ tail -f ~/.local/state/jarvis/jarvis.log
 ```
 
 - Always use `--kill-whom=main` with the USR1 wake: without it the signal also reaches `pw-record` and kills the microphone.
-- Pure functions (`is_goodbye`, `looks_unfinished`, sentence splitting) can be tested by importing the module with the venv Python and calling them with example strings.
+- `tests/` covers the pure functions (`is_goodbye`, `looks_unfinished`, `normalize`, `_sentences`, `SentenceStream`) and `WakeDetector` with a fake model. Importing `jarvis.py` must stay free of side effects: logging, the lock, the mic and GTK all start in `main()` / `Assistant()`.
+- Wake tuning: the log has `Wake up (score ..., N chunks ≥ ...)` and `Near miss: wake score ...`; `Media playing: stricter wake threshold` when `playerctl` reports a player.
 - The interrupt monitor logs `Interrupt monitor: ... max voice score ...`; use it to tune `[interrupt]` thresholds.
 
 ## Gotchas
 
 - Local Whisper on CUDA needs cuBLAS/cuDNN: they come from the pip packages `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` and are loaded by hand in `preload_cuda_libs()` in `jarvis_stt.py` (no system CUDA install needed).
-- VRAM is shared with games on the user's 8 GB RTX 4060: never import ctranslate2/CUDA in the main Jarvis process. Only ending the worker process frees the CUDA context. Measured: idle 0 MiB, loaded `large-v3-turbo` int8_float16 ~1.1 GB (float16 was 2.2 GB), 0.4 s per sentence, ~3 s to load; `small` on CPU ~1.6 s per sentence.
+- VRAM is shared with games on the user's 8 GB RTX 4060: never import ctranslate2/CUDA in the main Jarvis process. Only ending the worker process frees the CUDA context. Measured: idle 0 MiB, loaded `large-v3-turbo` int8_float16 ~1.3 GB with the CUDA context (float16 was 2.2 GB) and ~1.9 GB of RAM, 0.25 s per sentence, ~3–6 s to load; `small` on CPU ~1.6 s per sentence.
 
 - `sudo` does not work from the Claude desktop app's shells (no_new_privs). Ask the user to run sudo/apt commands in their own terminal.
 - The app's shells cannot see `~/.gitconfig` or `~/.ssh`: the user commits and pushes from their own terminal. End commit messages with the Claude co-author line.
 - COSMIC hides privileged Wayland protocols (layer-shell) from Flatpak apps, but native apps like Jarvis get them.
 - Kokoro voice is generated faster than real time and streamed raw to `pw-play --raw --format f32`; "deeper" voices play at `24000 * (1 - kokoro_deepen)` Hz.
+- openWakeWord's own `predict(patience=...)` never fires (it stores the zeroed scores in its history), so `WakeDetector` counts the chunks itself.
+- Run `claude` with `stdin=DEVNULL`: when its stdin is a pipe it waits 3 s for input first.
 - Keep spoken replies free of markdown: the system prompt in `build_system_prompt()` forbids lists, code blocks and emojis.
 
 ## Style

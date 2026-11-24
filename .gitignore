@@ -12,3 +12,4 @@ models/
 *.onnx
 *.bin
 *.log
+.pytest_cache/

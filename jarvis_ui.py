@@ -404,9 +404,12 @@ class Bubble(Gtk.Window):
         elif target == "close":
             self.assistant.end_conversation()
         elif target == "orb":
-            # the orb is the main control: interrupt while speaking, talk while idle
+            # the orb is the main control: interrupt while speaking, cancel while
+            # thinking, talk while idle
             if self.state == "speaking":
                 self.assistant.stop_speaking()
+            elif self.state == "thinking":
+                self.assistant.end_conversation()   # cancels Claude's request
             elif self.state == "sleeping":
                 self.assistant.manual_wake.set()
         return True

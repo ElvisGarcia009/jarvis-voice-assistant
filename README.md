@@ -11,11 +11,12 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 
 ## Features
 
-- **Hands-free wake word**: "Hey Jarvis" is detected offline with [openWakeWord](https://github.com/dscripka/openWakeWord). Nothing leaves your PC until you wake it up.
+- **Hands-free wake word**: "Hey Jarvis" is detected offline with [openWakeWord](https://github.com/dscripka/openWakeWord). Nothing leaves your PC until you wake it up. The score has to hold for a moment, and the bar is higher while a video or music is playing, so voices on TV rarely wake it up.
 - **Real actions on your PC**: requests are handled by Claude Code in non-interactive mode, with a safety-first permission mode.
+- **Fast answers**: Jarvis starts speaking the first sentence while Claude is still writing the rest, and says a short "One moment, I'm checking that" when Claude has to run commands first, so there are no long silences.
 - **Fast local voice**: [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) speaks while the rest of the answer is still being generated. You can blend voices and make them deeper. Edge TTS is available as an online alternative or fallback.
 - **Private, offline speech recognition**: Whisper runs on your own GPU or CPU with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so your voice never leaves your computer and no account is needed. On an RTX 4060 it transcribes a sentence in under half a second. Groq's free online Whisper API is available as an alternative.
-- **Leaves your GPU to your games**: the Whisper model (int8, about 1.1 GB of VRAM) only loads when you say "Hey Jarvis" and is freed a minute after the conversation, so a sleeping Jarvis uses no VRAM. Say "turn on gaming mode" and speech recognition moves to the CPU while you play.
+- **Leaves your GPU to your games**: the Whisper model (int8, about 1.3 GB of VRAM) only loads when you say "Hey Jarvis" and is freed a minute after the conversation, so a sleeping Jarvis uses no VRAM. Say "turn on gaming mode" and speech recognition moves to the CPU while you play.
 - **Interrupt by voice**: start talking while Jarvis speaks and he stops and listens, keeping your first words. With speakers instead of a headset, switch to `wakeword` mode and say "Hey Jarvis" to interrupt.
 - **Natural conversation**: keep talking without repeating the wake word. Say "thank you" (or "OK, thank you", "that's all", "gracias"...) and Jarvis goes back to sleep.
 - **Memory with automatic compaction**: wake Jarvis again within a few hours and he continues the same conversation. When it grows too large, he summarizes it into short notes and starts fresh with that memory, so answers stay fast and cheap.
@@ -45,8 +46,30 @@ flowchart LR
 - **openWakeWord** listens offline for "Hey Jarvis". Nothing leaves your PC before that.
 - **Silero VAD** records your request and waits if you pause in the middle of a sentence.
 - **Whisper** turns it into text, locally with faster-whisper (GPU or CPU) or online with Groq. The local model runs in a child process that starts when Jarvis wakes up and ends after the conversation, freeing all of its memory.
-- **Claude Code** (`claude -p --permission-mode auto`) does the task on your PC and keeps the conversation in `memory.json`, compacting it when it grows too large.
+- **Claude Code** (`claude -p --permission-mode auto`) does the task on your PC and keeps the conversation in `memory.json`, compacting it when it grows too large. Its answer is read as it is written (`--output-format stream-json`), so each sentence goes to the voice as soon as it is complete.
 - **Kokoro** speaks the answer locally while the **floating bubble** shows the state and captions. If you start talking, the **interrupt monitor** stops the voice and Jarvis listens.
+
+## Resource usage
+
+Measured on an Intel i5-12400F (12 threads) with an RTX 4060, using `benchmark.py`:
+
+| What Jarvis is doing | CPU (whole processor) | RAM | GPU memory |
+|---|---|---|---|
+| Sleeping, waiting for "Hey Jarvis" | about 1% | about 550 MB | 0 |
+| Awake, local Whisper `large-v3-turbo` on the GPU | short bursts | +1.9 GB | +1.3 GB |
+| Awake, gaming mode (Whisper `small` on the CPU) | short bursts | +0.7 GB | 0 |
+| Speaking (Kokoro) | about 50% for 1 s per 6 s of speech | included above | 0 |
+| Claude working (including the commands it runs) | about 2% | +200 MB | 0 |
+
+- Whisper loads when you wake Jarvis (about 6 s on the GPU, 2 s on the CPU, while he greets you) and is freed 60 s after the conversation, so the extra memory is only used while you talk to him.
+- Recognizing one sentence takes about 0.25 s on the GPU and 1 s in gaming mode. A simple request that runs one command took Claude (Haiku) about 7 s in total.
+
+Measure your own computer:
+
+```bash
+python3 benchmark.py monitor 120     # watch the running service; talk to Jarvis meanwhile
+~/.local/share/jarvis/venv/bin/python benchmark.py components --claude   # each piece on its own
+```
 
 ## Requirements
 
@@ -55,6 +78,7 @@ flowchart LR
 - **[Claude Code](https://docs.claude.com/en/docs/claude-code/overview)** installed and logged in, with a Claude subscription or API access.
 - For speech recognition, either a little disk space for the local Whisper model (about 1.6 GB, plus about 2 GB of CUDA libraries with an NVIDIA GPU) or a free **[Groq API key](https://console.groq.com/keys)**. The installer asks which one you prefer.
 - About 500 MB of disk space for the Python packages and voice models.
+- Optional: **playerctl** (`sudo apt install playerctl`), so Jarvis knows when a video or music is playing and is harder to wake up by mistake.
 - A headset is recommended, so Jarvis does not hear itself or the people around you.
 
 Tested on Pop!_OS 24.04 (COSMIC, Wayland).
@@ -98,6 +122,7 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
 | Wake Jarvis | Say "Hey Jarvis", or run `systemctl --user kill --kill-whom=main -s USR1 jarvis` (bind it to a keyboard shortcut) |
 | Ask something | Just talk after the greeting |
 | Interrupt | Just start talking (or say "Hey Jarvis" in `wakeword` mode), click the orb, or the ■ button |
+| Cancel a request | Click ✕, or the orb while Jarvis is thinking: Claude stops right away |
 | Finish | Say "thank you" / "OK, thank you" / "that's all", stay silent, or click ✕ |
 | Gaming mode | Say "turn on gaming mode" / "turn off gaming mode", or `touch` / `rm` `~/.local/state/jarvis/gaming_mode` |
 
@@ -145,7 +170,7 @@ Jarvis gives a voice interface to a tool that can run commands on your computer.
 ## Troubleshooting
 
 - **It never wakes up**: check that the right microphone is the default input, and look at the log. You can lower `[wake] threshold`.
-- **It wakes up by mistake**: raise `[wake] threshold` (for example to `0.7`).
+- **It wakes up by mistake** (for example with videos): the log shows `Wake up (score ...)` for every wake-up and `Near miss: wake score ...` for sounds that almost woke it. Compare them with your own "Hey Jarvis", then raise `[wake] patience` to `3`, `[wake] media_threshold` (used while media plays, needs `playerctl`) or `[wake] threshold` (for example to `0.7`).
 - **"I'm not logged in to Claude"**: run `claude auth login` in a terminal.
 - **No voice**: test `pw-play /usr/share/sounds/freedesktop/stereo/complete.oga`. Kokoro falls back to Edge TTS automatically if it fails.
 - **"Missing Groq API key"**: run `./install.sh` again, or write the key to `~/.config/jarvis/groq_key`.

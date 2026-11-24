@@ -33,6 +33,9 @@ edge_voice = "en-US-AndrewMultilingualNeural"
 greeting = "Yes? What can I do for you?"
 goodbye = "You're welcome. I'll be here if you need me."
 timeout = "I'll be here if you need me."
+# Said once when Claude starts working on your PC (running commands, reading files)
+# before it has said anything, so there is no long silence. "" = stay silent.
+working = "One moment, I'm checking that."
 
 [claude]
 # Claude model alias used by Claude Code: "sonnet" is fast for voice, "opus" is smarter
@@ -53,7 +56,7 @@ timeout = 300
 engine = "groq"
 local_model = "large-v3-turbo"
 device = "auto"        # "auto", "cuda" or "cpu"
-compute_type = "auto"  # "auto" = int8_float16 on GPU (about 1.1 GB of VRAM), int8 on CPU
+compute_type = "auto"  # "auto" = int8_float16 on GPU (about 1.3 GB of VRAM), int8 on CPU
 language = ""          # "" = detect automatically, or force one, e.g. "en"
 # The model loads when you say "Hey Jarvis" (while Jarvis greets you) and is freed
 # this many seconds after the conversation, so a sleeping Jarvis uses no VRAM.
@@ -79,6 +82,15 @@ summary_model = "haiku"
 [wake]
 # Minimum score (0 to 1) to accept "Hey Jarvis". Raise it if Jarvis wakes up by mistake.
 threshold = 0.5
+# How many 80 ms chunks in a row must reach `threshold`. A real "Hey Jarvis" keeps a
+# high score for several chunks; a similar sound in a video usually lasts only one.
+# 1 = wake on a single chunk (most sensitive). Raise it to 3 if videos still wake him.
+# The log shows "Near miss: wake score ..." for sounds that almost woke him up.
+patience = 2
+# Stricter threshold used while a video or music is playing (YouTube, Netflix,
+# Spotify, VLC... anything that shows media controls). Needs `playerctl`; without
+# it, `threshold` is always used. 0 = off.
+media_threshold = 0.8
 
 [listening]
 wait_for_speech = 10.0   # seconds Jarvis waits for you to start talking

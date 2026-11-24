@@ -28,6 +28,7 @@ import collections
 import fcntl
 import glob
 import io
+import itertools
 import json
 import math
 import logging
@@ -88,6 +89,8 @@ DEFAULTS = {
         "greeting": "Yes? What can I do for you?",
         "goodbye": "You're welcome. I'll be here if you need me.",
         "timeout": "I'll be here if you need me.",
+        "working": "One moment, I'm checking that.",   # said when Claude starts using
+                                                       # tools; "" = stay silent
     },
     "claude": {"model": "sonnet", "permission_mode": "auto", "timeout": 300},
     "stt": {
@@ -106,7 +109,12 @@ DEFAULTS = {
         "max_context_tokens": 60000,  # bigger than this = summarize and start fresh
         "summary_model": "haiku",     # model used to write the summary
     },
-    "wake": {"threshold": 0.5},
+    "wake": {
+        "threshold": 0.5,       # minimum score (0..1) to accept "Hey Jarvis"
+        "patience": 2,          # 80 ms chunks in a row that must reach it (1 = a single one)
+        "media_threshold": 0.8, # used instead while a video or music plays (needs playerctl);
+                                # 0 = off
+    },
     "listening": {"wait_for_speech": 10.0, "end_silence": 2.0, "max_utterance": 60.0,
                   "continue_wait": 4.0},
     "ui": {"show_on_start": False},
@@ -138,6 +146,7 @@ VAD_THRESHOLD = 0.5
 START_SPEECH = 0.16
 MIN_SPEECH = 0.30
 WAKE_MODEL = "hey_jarvis"
+NEAR_MISS = 0.3              # wake scores from here up are logged, to tune [wake] from real data
 
 KOKORO_MODEL = os.path.join(DATA_DIR, "models", "kokoro-v1.0.int8.onnx")
 KOKORO_VOICES = os.path.join(DATA_DIR, "models", "voices-v1.0.bin")
@@ -165,19 +174,25 @@ UNFINISHED_WORDS = {
 }
 # Phrases Whisper tends to hallucinate on pure noise
 HALLUCINATIONS = ["amara.org", "subtitulos", "subtitles by", "suscribete"]
+# Where one spoken sentence ends and the next begins
+SENTENCE_BREAK = re.compile(r"(?<=[.!?…:;])\s+|(?<=[.!?…][\"”'’])\s+")
 
 
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
-os.makedirs(STATE_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(os.path.join(STATE_DIR, "jarvis.log")),
-              logging.StreamHandler(sys.stdout)],
-)
 log = logging.getLogger("jarvis")
+
+
+def setup_logging():
+    """Called from main(), so importing this module (e.g. in tests) has no side effects."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler(os.path.join(STATE_DIR, "jarvis.log")),
+                  logging.StreamHandler(sys.stdout)],
+    )
 
 
 def single_instance():
@@ -219,6 +234,29 @@ def looks_unfinished(text):
         stripped = stripped[:-1]
     words = normalize(stripped).split()
     return bool(words) and words[-1] in UNFINISHED_WORDS
+
+
+def speakable(text):
+    """Removes markdown symbols that should not be read aloud."""
+    return re.sub(r"[*_`#>|]", "", text).strip()
+
+
+class SentenceStream:
+    """Collects text while Claude writes it and hands out each sentence once it
+    is complete, so Jarvis can start speaking before the whole answer exists."""
+
+    def __init__(self):
+        self.buf = ""
+
+    def add(self, text):
+        """Adds a piece of text; returns the sentences it completed."""
+        *done, self.buf = SENTENCE_BREAK.split(self.buf + text)
+        return [" ".join(d.split()) for d in done if d.strip()]
+
+    def flush(self):
+        """Returns whatever is left (the end of a reply), as one last sentence."""
+        rest, self.buf = " ".join(self.buf.split()), ""
+        return [rest] if rest else []
 
 
 def notify(title, body):
@@ -342,6 +380,90 @@ class Microphone:
                 self.q.get_nowait()
             except queue.Empty:
                 break
+
+
+# ----------------------------------------------------------------------------
+# Wake word ("Hey Jarvis" with openWakeWord)
+# ----------------------------------------------------------------------------
+class MediaWatch:
+    """Knows whether a video or music is playing (YouTube, Netflix, Spotify, VLC...),
+    by asking `playerctl` (MPRIS) every couple of seconds in a background thread,
+    so the 80 ms wake loop only reads a flag."""
+
+    INTERVAL = 1.5
+
+    def __init__(self):
+        self.playing = False
+        self.binary = shutil.which("playerctl")
+        if not self.binary:
+            log.info("playerctl is not installed: [wake] media_threshold is not used")
+            return
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                out = subprocess.run([self.binary, "--all-players", "status"],
+                                     capture_output=True, text=True, timeout=3).stdout
+                playing = "Playing" in out.split()
+            except Exception:
+                playing = False
+            if playing != self.playing:
+                log.info("Media %s", "playing: stricter wake threshold" if playing
+                         else "stopped: normal wake threshold")
+                self.playing = playing
+            time.sleep(self.INTERVAL)
+
+
+class WakeDetector:
+    """Feeds 80 ms microphone chunks to openWakeWord and decides when to wake up.
+
+    The score must stay at or above the threshold for `patience` chunks in a row:
+    a real "Hey Jarvis" holds a high score for several chunks, while a sound-alike
+    in a video usually spikes for one. (openWakeWord's own `patience` argument is
+    not used: it stores the zeroed scores in its history, so it never fires.)
+    While media is playing, the stricter `media_threshold` is used instead.
+
+    Scores between NEAR_MISS and a wake-up are logged (at most once per second, as
+    the peak of that moment), so false triggers can be compared with a real
+    "Hey Jarvis" in the log."""
+
+    def __init__(self, model):
+        wc = CFG["wake"]
+        self.model = model
+        self.threshold = float(wc["threshold"])
+        self.media_threshold = float(wc["media_threshold"])
+        self.patience = max(1, int(wc["patience"]))
+        self.media = MediaWatch() if self.media_threshold > self.threshold else None
+        self.run = 0             # chunks in a row at or above the threshold
+        self.peak = 0.0          # highest score not logged yet
+        self.held = 0            # longest run not logged yet
+        self.last_log = 0.0
+
+    def feed(self, chunk):
+        """Returns a description of the detection ("score 0.93, 3 chunks") or None."""
+        score = float(self.model.predict(chunk).get(WAKE_MODEL, 0.0))
+        threshold = (self.media_threshold if self.media and self.media.playing
+                     else self.threshold)
+        self.run = self.run + 1 if score >= threshold else 0
+        if self.run >= self.patience:
+            detected = f"score {max(score, self.peak):.2f}, {self.run} chunks ≥ {threshold:.2f}"
+            self.run, self.peak, self.held = 0, 0.0, 0
+            return detected
+        if score >= NEAR_MISS:
+            self.peak = max(self.peak, score)
+            self.held = max(self.held, self.run)
+            return None
+        now = time.monotonic()
+        if self.peak and now - self.last_log >= 1.0:   # the spike is over: log its peak
+            log.info("Near miss: wake score %.2f, %d of %d chunks ≥ %.2f",
+                     self.peak, self.held, self.patience, threshold)
+            self.peak, self.held, self.last_log = 0.0, 0, now
+        return None
+
+    def reset(self):
+        self.model.reset()
+        self.run, self.peak, self.held = 0, 0.0, 0
 
 
 # ----------------------------------------------------------------------------
@@ -471,7 +593,7 @@ class Assistant:
     def __init__(self):
         from openwakeword.model import Model
         from openwakeword.vad import VAD
-        self.wake = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
+        self.wake = WakeDetector(Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx"))
         self.vad = VAD()
         self.mic = Microphone()
         self.session = None
@@ -612,39 +734,51 @@ class Assistant:
 
     @staticmethod
     def _sentences(text):
-        return [p.strip() for p in re.split(r"(?<=[.!?…:;])\s+|(?<=[.!?…][\"”'’])\s+", " ".join(text.split())) if p.strip()] or [text]
+        return [p.strip() for p in SENTENCE_BREAK.split(" ".join(text.split())) if p.strip()] or [text]
 
-    def _kokoro_pieces(self, text):
+    def _kokoro_pieces(self, sentences):
         """First piece is short (up to the first comma) so speech starts sooner."""
-        sentences = self._sentences(text)
-        m = re.match(r"^(.{8,60}?[,—–])\s+(.+)$", sentences[0])
-        if m and len(sentences[0]) > 50:
-            return [m.group(1), m.group(2)] + sentences[1:]
-        return sentences
+        sentences = iter(sentences)
+        first = next(sentences, None)
+        if first is None:
+            return
+        m = re.match(r"^(.{8,60}?[,—–])\s+(.+)$", first)
+        if m and len(first) > 50:
+            yield m.group(1)
+            yield m.group(2)
+        else:
+            yield first
+        yield from sentences
 
-    def _speak_kokoro(self, text):
-        """Synthesizes locally and streams audio to the speaker while it is created."""
+    def _speak_kokoro(self, sentences):
+        """Synthesizes locally and streams audio to the speaker while it is created.
+        `sentences` may still be growing (Claude is writing the rest). Returns None
+        when done, or the sentences not spoken yet if Kokoro failed."""
         v = CFG["voice"]
+        play_rate = 24000 * (1 - self.deepen)
         player = subprocess.Popen(
             # playing slightly slower than synthesized = deeper pitch
-            ["pw-play", "--raw", "--format", "f32", "--rate", str(int(24000 * (1 - self.deepen))),
+            ["pw-play", "--raw", "--format", "f32", "--rate", str(int(play_rate)),
              "--channels", "1", "-"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with self.player_lock:
             self.player = player
-        play_rate = 24000 * (1 - self.deepen)
-        started = False
+        pieces = self._kokoro_pieces(sentences)
         try:
-            for piece in self._kokoro_pieces(text):
+            for piece in pieces:
                 if self.speak_cancel.is_set() or self.end_requested.is_set():
                     break
-                audio, _ = self.kokoro.create(piece, voice=self.voice_style,
-                                              speed=float(v["kokoro_speed"]) / (1 - self.deepen),
-                                              lang=v["kokoro_lang"])
+                try:
+                    audio, _ = self.kokoro.create(piece, voice=self.voice_style,
+                                                  speed=float(v["kokoro_speed"]) / (1 - self.deepen),
+                                                  lang=v["kokoro_lang"])
+                except Exception as e:
+                    log.warning("Kokoro failed: %s", e)
+                    player.kill()
+                    player.wait()
+                    return itertools.chain([piece], pieces)
                 self._timeline_add(piece, audio, play_rate)
-                if not started:
-                    self.ui("set_state", "speaking")
-                    started = True
+                self.ui("set_state", "speaking")
                 try:
                     player.stdin.write(np.asarray(audio, dtype=np.float32).tobytes())
                     player.stdin.flush()
@@ -654,15 +788,15 @@ class Assistant:
                 player.stdin.close()
             except Exception:
                 pass
-            player.wait(timeout=180)
-        except Exception as e:
-            log.warning("Kokoro failed: %s", e)
-            player.kill()
-            return False
+            try:
+                player.wait(timeout=180)
+            except subprocess.TimeoutExpired:
+                player.kill()
+                player.wait()
         finally:
             with self.player_lock:
                 self.player = None
-        return True
+        return None
 
     def _synth_edge(self, text):
         import edge_tts
@@ -678,25 +812,27 @@ class Assistant:
         os.remove(mp3)
         return None
 
-    def _speak_edge(self, text):
+    def _speak_edge(self, sentences):
         """Online voice, sentence by sentence (the next one is prepared while one plays)."""
         ready = queue.Queue()
 
         def producer():
-            for sentence in self._sentences(text):
+            for sentence in sentences:
                 if self.speak_cancel.is_set() or self.end_requested.is_set():
                     break
-                ready.put(self._synth_edge(sentence))
-            ready.put(False)
+                ready.put((sentence, self._synth_edge(sentence)))
+            ready.put(None)
 
         threading.Thread(target=producer, daemon=True).start()
         while True:
-            mp3 = ready.get()
-            if mp3 is False:
+            item = ready.get()
+            if item is None:
                 break
+            sentence, mp3 = item
             if mp3 is None:
                 continue
             if not self.speak_cancel.is_set() and not self.end_requested.is_set():
+                self._fake_timeline(sentence)
                 self.ui("set_state", "speaking")
                 self._play(mp3)
             os.remove(mp3)
@@ -716,20 +852,19 @@ class Assistant:
         ic = CFG["interrupt"]
         mode = ic["mode"]
         min_speech, threshold = float(ic["min_speech"]), float(ic["vad_threshold"])
-        wake_threshold = float(CFG["wake"]["threshold"])
         self.mic.flush()
         self.barge_vad.reset_states()
         pre = collections.deque(maxlen=10)   # ~0.8 s of audio before the interruption
         run, elapsed = 0.0, 0.0
         stats = {"chunks": 0, "max_vad": 0.0, "max_rms": 0.0, "max_run": 0.0}
         try:
-            self._barge_loop(done, mode, min_speech, threshold, wake_threshold, pre, stats)
+            self._barge_loop(done, mode, min_speech, threshold, pre, stats)
         finally:
             log.info("Interrupt monitor: %d chunks, max voice score %.2f, max loudness %.0f, "
                      "longest speech %.2fs", stats["chunks"], stats["max_vad"],
                      stats["max_rms"], stats["max_run"])
 
-    def _barge_loop(self, done, mode, min_speech, threshold, wake_threshold, pre, stats):
+    def _barge_loop(self, done, mode, min_speech, threshold, pre, stats):
         run, elapsed = 0.0, 0.0
         while not done.is_set():
             try:
@@ -743,8 +878,9 @@ class Assistant:
             if elapsed < 0.3:      # ignore the very start (speaker click, own breath)
                 continue
             if mode == "wakeword":
-                if self.wake.predict(chunk).get(WAKE_MODEL, 0.0) >= wake_threshold:
-                    log.info("Interrupted by wake word")
+                detected = self.wake.feed(chunk)
+                if detected:
+                    log.info("Interrupted by wake word (%s)", detected)
                     self.wake.reset()
                     self.barge_frames = []
                     self.stop_speaking()
@@ -768,12 +904,17 @@ class Assistant:
         return frames
 
     def speak(self, text, show=True, interruptible=True):
-        text = re.sub(r"[*_`#>|]", "", text).strip()
+        text = speakable(text)
         if not text:
             return
         log.info("Jarvis: %s", text)
         if show:
             self.ui("add_message", "jarvis", text)
+        self._speak_sentences(self._sentences(text), interruptible)
+
+    def _speak_sentences(self, sentences, interruptible=True):
+        """Speaks sentences one by one. `sentences` can be a generator that waits
+        for Claude to write the next one."""
         self.speak_cancel.clear()
         self.barge_frames = None
         self._timeline_reset()
@@ -784,9 +925,9 @@ class Assistant:
             monitor.start()
         started_at = time.monotonic()
         try:
-            if self.kokoro is None or not self._speak_kokoro(text):
-                self._fake_timeline(text)
-                self._speak_edge(text)
+            rest = self._speak_kokoro(sentences) if self.kokoro else sentences
+            if rest is not None:
+                self._speak_edge(rest)
         finally:
             log.info("Spoke for %.1fs%s", time.monotonic() - started_at,
                      " (interrupted)" if self.speak_cancel.is_set() else "")
@@ -936,7 +1077,7 @@ class Assistant:
                "--append-system-prompt", system_prompt]
         if session:
             cmd += ["--resume", session]
-        out = subprocess.run(cmd, capture_output=True, text=True,
+        out = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                              timeout=int(c["timeout"]), cwd=HOME)
         try:
             return json.loads(out.stdout), out
@@ -984,27 +1125,205 @@ class Assistant:
         log.info("Memory compacted. New summary:\n%s", self.memory["summary"])
 
     # ---------- Claude ----------
-    def ask_claude(self, text):
+    def _run_claude_stream(self, text, model, session, system_prompt, on_event):
+        """Runs Claude Code and reads its answer while it is being written.
+        `on_event(kind, value)` gets ("session", id), ("text", piece), ("text_end", None)
+        and ("tool", name). Claude is stopped on timeout or when you end the
+        conversation (✕, or the orb while thinking). Returns (result event or None,
+        status, other output), status being "ok", "timeout" or "cancelled"."""
+        c = CFG["claude"]
+        cmd = [claude_binary(), "-p", text, "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages", "--model", model,
+               "--permission-mode", c["permission_mode"], "--append-system-prompt", system_prompt]
+        if session:
+            cmd += ["--resume", session]
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, cwd=HOME,
+                                start_new_session=True)   # own process group: see _stop_claude
+        lines = queue.Queue()
+        other = collections.deque(maxlen=40)   # stderr and non-JSON lines, for error messages
+
+        def read_stdout():
+            for line in iter(proc.stdout.readline, ""):
+                lines.put(line)
+            lines.put(None)
+
+        def read_stderr():
+            for line in iter(proc.stderr.readline, ""):
+                other.append(line)
+
+        threading.Thread(target=read_stdout, daemon=True).start()
+        threading.Thread(target=read_stderr, daemon=True).start()
+        deadline = time.monotonic() + int(c["timeout"])
+        result, status = None, "ok"
+        try:
+            while True:
+                if self.end_requested.is_set():
+                    status = "cancelled"
+                    break
+                if time.monotonic() > deadline:
+                    status = "ok" if result else "timeout"
+                    break
+                try:
+                    line = lines.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if line is None:
+                    break
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    other.append(line)
+                    continue
+                if not isinstance(event, dict) or event.get("parent_tool_use_id"):
+                    continue   # a subagent's work, not the reply
+                kind = event.get("type")
+                if kind == "system" and event.get("subtype") == "init":
+                    on_event("session", event.get("session_id"))
+                elif kind == "stream_event":
+                    ev = event.get("event") or {}
+                    delta = ev.get("delta") or {}
+                    block = ev.get("content_block") or {}
+                    if ev.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+                        on_event("text", delta.get("text") or "")
+                    elif ev.get("type") == "content_block_start" and block.get("type") == "tool_use":
+                        on_event("tool", block.get("name") or "")
+                    elif ev.get("type") == "content_block_stop":
+                        on_event("text_end", None)
+                elif kind == "result":
+                    result = event
+                    deadline = min(deadline, time.monotonic() + 10)   # it should exit now
+        finally:
+            if status == "ok" and proc.poll() is None:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if proc.poll() is None:
+                self._stop_claude(proc)
+        return result, status, "".join(other)
+
+    @staticmethod
+    def _stop_claude(proc):
+        """Ends Claude Code and every command it started: they share its process
+        group (apps it launched with setsid have their own and keep running)."""
+        def signal_group(sig):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        signal_group(signal.SIGTERM)
+        until = time.monotonic() + 3
+        # waitid(WNOWAIT) sees the exit without reaping it, so the group id stays ours
+        while time.monotonic() < until and not os.waitid(
+                os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+            time.sleep(0.1)
+        signal_group(signal.SIGKILL)   # whatever is still running
+        proc.wait()                    # reap it: no zombie left behind
+        log.info("Claude stopped")
+
+    def ask_and_speak(self, text):
+        """Asks Claude and speaks the answer sentence by sentence while it is still
+        being written (Claude runs in a background thread)."""
         c = CFG["claude"]
         log.info("Asking Claude: %s", text)
-        try:
-            data, out = self._run_claude(text, c["model"], self.session,
-                                         self._system_prompt_with_memory())
-        except subprocess.TimeoutExpired:
-            return "That is taking too long. It's better to do it directly in Claude Code."
-        if data is None:
-            log.error("Unexpected Claude output: %s %s", out.stdout[-500:], out.stderr[-500:])
-            if "login" in (out.stdout + out.stderr).lower():
-                return "I'm not logged in to Claude. Run claude auth login in a terminal."
-            return "I had a problem talking to Claude."
-        self.session = data.get("session_id") or self.session
-        if data.get("is_error"):
-            log.error("Claude returned an error: %s", str(data)[:500])
-        if CFG["memory"]["enabled"]:
-            self.memory.update({"session_id": self.session, "last_used": time.time(),
-                                "context_tokens": self._context_tokens(data)})
+        sentences = queue.Queue()     # complete sentences to speak; None = the end
+        splitter = SentenceStream()
+        said = []                     # what Jarvis says, for the bubble and the log
+        info = {"session": None, "streamed": False}
+
+        def say(parts):
+            for part in parts:
+                part = speakable(part)
+                if part:
+                    said.append(part)
+                    self.ui("add_message", "jarvis", " ".join(said))
+                    sentences.put(part)
+
+        def on_event(kind, value):
+            if kind == "session":
+                info["session"] = value
+            elif kind == "text":
+                info["streamed"] = True
+                say(splitter.add(value))
+            elif kind == "text_end":
+                say(splitter.flush())
+            elif kind == "tool":
+                say(splitter.flush())
+                log.info("Claude is using %s", value)
+                if not said:   # nothing said yet: avoid a long silence while it works
+                    say([CFG["phrases"]["working"]])
+
+        def worker():
+            try:
+                data, status, output = self._run_claude_stream(
+                    text, c["model"], self.session, self._system_prompt_with_memory(), on_event)
+                say(splitter.flush())
+                self._after_claude(data, status, output, info, say)
+            except Exception as e:
+                log.exception("Claude request failed: %s", e)
+                say(["I had a problem talking to Claude."])
+            finally:
+                sentences.put(None)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        first = self._next_sentence(sentences)   # the orb keeps "thinking" until then
+        if first is not None:
+            self._speak_sentences(itertools.chain([first], self._more_sentences(sentences)))
+        if thread.is_alive():
+            # you interrupted: let Claude finish its task silently (your words are kept)
+            self.ui("set_state", "listening")
+            thread.join()
+        if said:
+            log.info("Jarvis: %s", " ".join(said))
+
+    def _next_sentence(self, sentences):
+        while not self.end_requested.is_set():
+            try:
+                return sentences.get(timeout=0.1)
+            except queue.Empty:
+                continue
+        return None
+
+    def _more_sentences(self, sentences):
+        """Yields sentences as Claude writes them; stops if you interrupt."""
+        while not (self.speak_cancel.is_set() or self.end_requested.is_set()):
+            try:
+                sentence = sentences.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if sentence is None:
+                return
+            yield sentence
+
+    def _after_claude(self, data, status, output, info, say):
+        """Errors, memory and the session id, once Claude is done."""
+        if data:
+            self.session = data.get("session_id") or self.session
+        elif info["session"]:
+            self.session = info["session"]
+        if status == "cancelled":
+            log.info("Request cancelled by the user")
+        elif status == "timeout":
+            say(["That is taking too long. It's better to do it directly in Claude Code."])
+        elif data is None:
+            log.error("Unexpected Claude output: %s", output[-500:])
+            if "login" in output.lower():
+                say(["I'm not logged in to Claude. Run claude auth login in a terminal."])
+            else:
+                say(["I had a problem talking to Claude."])
+        else:
+            if data.get("is_error"):
+                log.error("Claude returned an error: %s", str(data)[:500])
+            if not info["streamed"]:
+                say(self._sentences((data.get("result") or "").strip() or "Done."))
+        if CFG["memory"]["enabled"] and self.session:
+            self.memory.update({"session_id": self.session, "last_used": time.time()})
+            if data:
+                self.memory["context_tokens"] = self._context_tokens(data)
             self._save_memory(self.memory)
-        return (data.get("result") or "").strip() or "Done."
 
     # ---------- conversation ----------
     def conversation(self):
@@ -1053,15 +1372,11 @@ class Assistant:
                 self.speak(p["goodbye"], interruptible=False)
                 return
             self._play(SOUND_THINK)
-            reply = self.ask_claude(text)
-            if self.end_requested.is_set():
-                break
-            self.speak(reply)
+            self.ask_and_speak(text)
 
     def run(self):
         log.info("Jarvis ready. Waiting for 'Hey Jarvis'...")
         notify("Jarvis", "Ready. Say “Hey Jarvis” when you need me.")
-        threshold = float(CFG["wake"]["threshold"])
         while True:
             if self.manual_wake.is_set():
                 self.manual_wake.clear()
@@ -1071,9 +1386,9 @@ class Assistant:
                 chunk = self.mic.read(timeout=0.5)
             except queue.Empty:
                 continue
-            score = self.wake.predict(chunk).get(WAKE_MODEL, 0.0)
-            if score >= threshold:
-                self._run_conversation(f"score {score:.2f}")
+            detected = self.wake.feed(chunk)
+            if detected:
+                self._run_conversation(detected)
 
     def _run_conversation(self, why):
         log.info("Wake up (%s)", why)
@@ -1101,6 +1416,7 @@ class Assistant:
 
 
 def main():
+    setup_logging()
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     _lock = single_instance()  # noqa: F841 (keep the lock open)
