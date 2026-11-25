@@ -48,6 +48,14 @@ model = "sonnet"
 # ask Jarvis to do anything.
 permission_mode = "auto"
 timeout = 300
+# Tools Claude may use. Each tool's description is sent with every request, so
+# fewer tools = fewer tokens per question: with these 8, a question that runs a
+# command costs ~22k tokens instead of ~100k with Claude Code's full set.
+# "default" = every built-in tool.
+tools = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+# true = also load your Claude Code MCP servers, skills and slash commands
+# (more tokens per question; only if you want Jarvis to use them).
+extensions = false
 
 [stt]
 # How your voice becomes text:

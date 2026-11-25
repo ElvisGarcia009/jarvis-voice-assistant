@@ -63,13 +63,28 @@ Measured on an Intel i5-12400F (12 threads) with an RTX 4060, using `benchmark.p
 | Claude working (including the commands it runs) | about 2% | +200 MB | 0 |
 
 - Whisper loads when you wake Jarvis (about 6 s on the GPU, 2 s on the CPU, while he greets you) and is freed 60 s after the conversation, so the extra memory is only used while you talk to him.
+- Claude usage: Jarvis gives Claude Code only the 8 tools a voice assistant needs (`[claude] tools`) and skips your MCP servers and skills (`[claude] extensions`), so every request starts at about 11k tokens instead of 36k. A question that runs a command costs about 22k tokens, most of them cheap cached reads.
 - Recognizing one sentence takes about 0.25 s on the GPU and 1 s in gaming mode. A simple request that runs one command took Claude (Haiku) about 7 s in total.
+
+### Claude tokens and cost per question
+
+Measured with `benchmark.py tokens --live` (three questions in one fresh conversation). Cost is at Anthropic's API prices; with a Claude subscription you pay the plan instead and the tokens count toward its usage limits.
+
+| Question | Haiku 5.5 | Sonnet 5.5 |
+|---|---|---|
+| Chat answer, no tools | ~11k tokens, $0.0003 | ~10k tokens, $0.016 |
+| Runs one command | ~22k tokens, $0.0008 | ~20k tokens, $0.036 |
+| Runs a few commands | ~23k tokens, $0.0014 | ~21k tokens, $0.044 |
+
+About 90% of those tokens are the conversation re-read from Claude's prompt cache, which costs a tenth (Haiku) or a twentieth (Sonnet) of a normal token. Claude's spoken answer itself is usually 50 to 500 tokens. Every request also logs its tokens and cost in `~/.local/state/jarvis/jarvis.log` (`Claude usage: ...`).
 
 Measure your own computer:
 
 ```bash
 python3 benchmark.py monitor 120     # watch the running service; talk to Jarvis meanwhile
 ~/.local/share/jarvis/venv/bin/python benchmark.py components --claude   # each piece on its own
+python3 benchmark.py tokens          # tokens and cost of every question you asked Jarvis (free)
+~/.local/share/jarvis/venv/bin/python benchmark.py tokens --live --model sonnet   # three sample questions
 ```
 
 ## Requirements

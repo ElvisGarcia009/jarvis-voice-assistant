@@ -100,7 +100,13 @@ DEFAULTS = {
         "terminal_on": "Terminal activated. I'll show you every command I run.",
         "terminal_off": "Terminal deactivated. I'll keep working in the background.",
     },
-    "claude": {"model": "sonnet", "permission_mode": "auto", "timeout": 300},
+    "claude": {
+        "model": "sonnet", "permission_mode": "auto", "timeout": 300,
+        # Only the tools a voice assistant needs: each tool's description is sent with
+        # every request (Claude Code's full set is ~25k tokens). "default" = all of them.
+        "tools": "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch",
+        "extensions": False,   # true = also load your MCP servers, skills and commands
+    },
     "stt": {
         "engine": "groq",                 # "groq" (online, free key) or "local" (offline)
         "local_model": "large-v3-turbo",  # faster-whisper model for engine = "local"
@@ -1288,19 +1294,44 @@ class Assistant:
         return (self.system_prompt + "\n\nMEMORY FROM EARLIER CONVERSATIONS (use it when relevant, "
                 "do not read it aloud):\n" + summary)
 
-    def _run_claude(self, text, model, session, system_prompt):
+    @staticmethod
+    def _claude_cmd(text, model, session, system_prompt, output):
+        """The `claude -p` command line; `output` = the output format options."""
         c = CFG["claude"]
-        cmd = [claude_binary(), "-p", text, "--output-format", "json",
-               "--model", model, "--permission-mode", c["permission_mode"],
-               "--append-system-prompt", system_prompt]
+        cmd = [claude_binary(), "-p", text, *output, "--model", model,
+               "--permission-mode", c["permission_mode"], "--append-system-prompt", system_prompt]
+        tools = str(c["tools"]).strip()
+        if tools and tools != "default":
+            cmd += ["--tools", tools]
+        if not c["extensions"]:
+            cmd += ["--strict-mcp-config", "--disable-slash-commands"]
         if session:
             cmd += ["--resume", session]
+        return cmd
+
+    def _run_claude(self, text, model, session, system_prompt):
+        c = CFG["claude"]
+        cmd = self._claude_cmd(text, model, session, system_prompt, ["--output-format", "json"])
         out = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                              timeout=int(c["timeout"]), cwd=HOME)
         try:
             return json.loads(out.stdout), out
         except json.JSONDecodeError:
             return None, out
+
+    @staticmethod
+    def _log_usage(data):
+        """One line per request, read by `benchmark.py tokens`. The cost is Claude
+        Code's own estimate at API prices (with a subscription you pay the plan)."""
+        u = data.get("usage") or {}
+        parts = {k: int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                  "cache_read_input_tokens", "output_tokens")}
+        models = ",".join(data.get("modelUsage") or {}) or "?"
+        log.info("Claude usage: %d tokens (new %d, cache write %d, cache read %d, output %d), "
+                 "%d turns, $%.4f, %s", sum(parts.values()), parts["input_tokens"],
+                 parts["cache_creation_input_tokens"], parts["cache_read_input_tokens"],
+                 parts["output_tokens"], int(data.get("num_turns") or 0),
+                 float(data.get("total_cost_usd") or 0), models)
 
     @staticmethod
     def _context_tokens(data):
@@ -1351,11 +1382,9 @@ class Assistant:
         conversation (✕, or the orb while thinking). Returns (result event or None,
         status, other output), status being "ok", "timeout" or "cancelled"."""
         c = CFG["claude"]
-        cmd = [claude_binary(), "-p", text, "--output-format", "stream-json", "--verbose",
-               "--include-partial-messages", "--model", model,
-               "--permission-mode", c["permission_mode"], "--append-system-prompt", system_prompt]
-        if session:
-            cmd += ["--resume", session]
+        cmd = self._claude_cmd(text, model, session, system_prompt,
+                               ["--output-format", "stream-json", "--verbose",
+                                "--include-partial-messages"])
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, cwd=HOME,
                                 start_new_session=True)   # own process group: see _stop_claude
@@ -1554,6 +1583,8 @@ class Assistant:
                 log.error("Claude returned an error: %s", str(data)[:500])
             if not info["streamed"]:
                 say(self._sentences((data.get("result") or "").strip() or "Done."))
+        if data:
+            self._log_usage(data)
         if CFG["memory"]["enabled"] and self.session:
             self.memory.update({"session_id": self.session, "last_used": time.time()})
             if data:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Measures how much CPU, RAM and GPU memory (VRAM) Jarvis uses.
+Measures how much CPU, RAM, GPU memory (VRAM) and Claude tokens Jarvis uses.
 
   python3 benchmark.py monitor [SECONDS]
       Watches the running Jarvis service (everything it starts counts too:
@@ -13,11 +13,25 @@ Measures how much CPU, RAM and GPU memory (VRAM) Jarvis uses.
       (gaming mode on the CPU and the normal one) and, with --claude, one real
       Claude request that runs a terminal command (uses a little of your plan).
 
+  python3 benchmark.py tokens [--since YYYY-MM-DD]
+      Tokens and cost of every question you asked Jarvis, read from Claude
+      Code's own conversation history (~/.claude/projects). Free: no requests.
+
+  ~/.local/share/jarvis/venv/bin/python benchmark.py tokens --live [--model sonnet]
+      Asks Claude three sample questions the way Jarvis does (a chat answer, one
+      shell command, a few commands) in one fresh conversation and reports each
+      one's tokens and cost. Uses a little of your plan.
+
+Cost is what the tokens would cost at Anthropic's API prices. With a Claude
+subscription you pay the plan instead; the tokens count toward its usage limits.
+
 RAM is PSS (shared libraries split between the processes that use them), the
 fairest "how much does this cost" number. CPU % is of the whole processor.
 """
+import glob
 import json
 import os
+import statistics
 import subprocess
 import sys
 import threading
@@ -286,11 +300,158 @@ def components(with_claude):
         print(f"   answer: {answer[:100]}")
 
 
+# ---------------------------------------------------------------- tokens
+# USD per million tokens (Anthropic API, prompts up to 100k tokens). Claude Code
+# writes its cache with a 1-hour lifetime (2x input price); reads are cheap.
+PRICES = {   # model: (input, output, cache write 5 min, cache write 1 h, cache read)
+    "haiku-5-5": (0.10, 0.50, 0.125, 0.20, 0.01),
+    "sonnet-5-5": (2.00, 10.00, 2.50, 4.00, 0.10),
+    "opus-5-5": (4.00, 20.00, 5.00, 8.00, 0.20),
+}
+JARVIS_MARK = "Your name is Jarvis"   # from build_system_prompt(), stored in the history
+
+
+def price_of(model):
+    return next((p for key, p in PRICES.items() if key in (model or "")), None)
+
+
+def call_cost(model, usage):
+    p = price_of(model)
+    if not p:
+        return None
+    cw = usage.get("cache_creation") or {}
+    w5, w1 = cw.get("ephemeral_5m_input_tokens"), cw.get("ephemeral_1h_input_tokens")
+    if w5 is None and w1 is None:
+        w5, w1 = 0, usage.get("cache_creation_input_tokens", 0)
+    return (usage.get("input_tokens", 0) * p[0] + usage.get("output_tokens", 0) * p[1]
+            + (w5 or 0) * p[2] + (w1 or 0) * p[3]
+            + usage.get("cache_read_input_tokens", 0) * p[4]) / 1e6
+
+
+def jarvis_questions(since=""):
+    """Every question asked through Jarvis, with the usage of all its API calls."""
+    folder = os.path.expanduser("~/.claude/projects/" + os.path.expanduser("~").replace("/", "-"))
+    questions = []
+    for path in glob.glob(os.path.join(folder, "*.jsonl")):
+        with open(path, errors="replace") as f:
+            text = f.read()
+        if JARVIS_MARK not in text:
+            continue
+        current, seen = None, set()
+        for line in text.splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("type") == "user" and e.get("promptSource") == "sdk" \
+                    and isinstance((e.get("message") or {}).get("content"), str):
+                q = e["message"]["content"]
+                current = {"q": q, "time": e.get("timestamp", ""), "calls": 0, "new": 0,
+                           "write": 0, "read": 0, "out": 0, "cost": 0.0, "model": "",
+                           "summary": q.startswith("Write private notes")}
+                questions.append(current)
+            elif e.get("type") == "assistant" and current and not e.get("isSidechain"):
+                m = e.get("message") or {}
+                if m.get("id") in seen:
+                    continue   # one API reply is stored once per content block
+                seen.add(m.get("id"))
+                u = m.get("usage") or {}
+                current["calls"] += 1
+                current["model"] = m.get("model", "")
+                current["new"] += u.get("input_tokens", 0)
+                current["write"] += u.get("cache_creation_input_tokens", 0)
+                current["read"] += u.get("cache_read_input_tokens", 0)
+                current["out"] += u.get("output_tokens", 0)
+                current["cost"] += call_cost(current["model"], u) or 0.0
+    return [q for q in questions if q["calls"] and not q["summary"] and q["time"] >= since]
+
+
+def token_table(rows):
+    if not rows:
+        print("   (nothing yet)")
+        return
+    for q in rows:
+        q["total"] = q["new"] + q["write"] + q["read"] + q["out"]
+    print(f"   {'':24} {'median':>9} {'average':>9} {'max':>10}")
+    for label, key in (("total tokens", "total"), ("  read from cache (cheap)", "read"),
+                       ("  written to cache", "write"), ("  Claude's answer (output)", "out"),
+                       ("API calls", "calls")):
+        vals = [q[key] for q in rows]
+        print(f"   {label:24} {statistics.median(vals):>9,.0f} {statistics.mean(vals):>9,.0f} "
+              f"{max(vals):>10,}")
+    costs = [q["cost"] for q in rows]
+    print(f"   {'cost (USD, API prices)':24} {statistics.median(costs):>9.4f} "
+          f"{statistics.mean(costs):>9.4f} {max(costs):>10.4f}")
+
+
+def tokens_history(since):
+    rows = jarvis_questions(since)
+    if not rows:
+        print("No Jarvis questions found in Claude Code's history" + (f" since {since}." if since else "."))
+        return
+    first, last = min(q["time"] for q in rows), max(q["time"] for q in rows)
+    print(f"{len(rows)} questions asked through Jarvis, {first[:10]} to {last[:10]} "
+          f"(Claude Code's conversation history)\n")
+    for model in sorted({q["model"] for q in rows}):
+        group = [q for q in rows if q["model"] == model]
+        for label, part in (("answered without tools", [q for q in group if q["calls"] == 1]),
+                            ("ran commands / used tools", [q for q in group if q["calls"] > 1])):
+            if part:
+                print(f"== {model}: {label} ({len(part)} questions)")
+                token_table(part)
+    total = sum(q["cost"] for q in rows)
+    print(f"\nAll {len(rows)} questions together: ${total:.2f} at API prices "
+          f"(${total / len(rows):.4f} per question on average).")
+
+
+def tokens_live(model=None):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import jarvis
+    model = model or jarvis.CFG["claude"]["model"]
+    print(f"Asking Claude ({model}) three questions the way Jarvis does, in one fresh conversation...\n")
+    jarvis.CFG["memory"]["enabled"] = False   # do not touch Jarvis' real memory
+    a = jarvis.Assistant.__new__(jarvis.Assistant)
+    a.session, a.memory = None, {}
+    a.end_requested = threading.Event()
+    a.system_prompt = jarvis.build_system_prompt()
+    samples = [("chat answer", "In one sentence, what is a good name for a pet turtle?"),
+               ("one command", "How much free disk space do I have?"),
+               ("a few commands", "Which three folders in my home use the most space, and how "
+                                  "many files are in my Downloads folder?")]
+    print(f"{'question':16} {'tokens':>8} {'cache read':>10} {'output':>7} {'turns':>5} "
+          f"{'seconds':>7} {'cost USD':>9}")
+    total = 0.0
+    for label, question in samples:
+        t = time.monotonic()
+        data, status, _ = a._run_claude_stream(question, model, a.session,
+                                               a.system_prompt, lambda *_: None)
+        took = time.monotonic() - t
+        if not data:
+            print(f"{label:16} failed ({status})")
+            continue
+        a.session = data.get("session_id") or a.session
+        u = data.get("usage") or {}
+        tokens = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                   "cache_read_input_tokens", "output_tokens"))
+        cost = float(data.get("total_cost_usd") or 0)
+        total += cost
+        print(f"{label:16} {tokens:>8,} {int(u.get('cache_read_input_tokens') or 0):>10,} "
+              f"{int(u.get('output_tokens') or 0):>7,} {int(data.get('num_turns') or 0):>5} "
+              f"{took:>7.1f} {cost:>9.4f}")
+    print(f"\nTotal: ${total:.4f} (Claude Code's own cost estimate, API prices). "
+          f"The first question pays to fill the cache; later ones mostly read it.")
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args[:1] == ["monitor"]:
         monitor(int(args[1]) if len(args) > 1 else 60)
     elif args[:1] == ["components"]:
         components("--claude" in args)
+    elif args[:1] == ["tokens"]:
+        if "--live" in args:
+            tokens_live(args[args.index("--model") + 1] if "--model" in args else None)
+        else:
+            tokens_history(args[args.index("--since") + 1] if "--since" in args else "")
     else:
         print(__doc__)
