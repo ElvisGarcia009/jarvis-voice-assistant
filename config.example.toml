@@ -36,6 +36,9 @@ timeout = "I'll be here if you need me."
 # Said once when Claude starts working on your PC (running commands, reading files)
 # before it has said anything, so there is no long silence. "" = stay silent.
 working = "One moment, I'm checking that."
+# Answers to the voice commands "activate terminal" / "deactivate terminal"
+terminal_on = "Terminal activated. I'll show you every command I run."
+terminal_off = "Terminal deactivated. I'll keep working in the background."
 
 [claude]
 # Claude model alias used by Claude Code: "sonnet" is fast for voice, "opus" is smarter
@@ -118,6 +121,8 @@ show_on_start = false
 # terminal window opens and shows every command and its output, live. The same
 # window is used for the rest of the conversation and closes when Jarvis goes back
 # to sleep. Everything is also saved in ~/.local/state/jarvis/activity.log
+# Say "deactivate terminal" or "activate terminal" to change it by voice (that
+# choice is remembered in ~/.local/state/jarvis/activity_terminal and wins over this).
 show_terminal = true
 # "auto" finds your terminal app (COSMIC Terminal, GNOME Terminal, Konsole...).
 # Or give a command that runs what follows it and stays open with its window,

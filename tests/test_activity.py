@@ -1,4 +1,6 @@
 """Tests for how the activity terminal shows Claude's commands and their output."""
+import pytest
+
 import jarvis
 
 
@@ -29,3 +31,23 @@ def test_file_contents_are_only_summarized():
 def test_errors_are_always_shown():
     assert "permission denied" in jarvis.format_tool_output("permission denied", is_error=True,
                                                             full=False)
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Deactivate terminal.", False), ("Deactivate the terminal, please", False),
+    ("Turn off the terminal", False), ("Desactiva la terminal", False),
+    ("Activate terminal.", True), ("Activate the terminal", True), ("Turn the terminal on", True),
+    ("Activa la terminal.", True),
+    # real sentences from the log, with filler words around the command
+    ("Okay, wait, wait, wait. Deactivate the terminal.", False),
+    ("Yeah, deactivate the terminal", False),
+    ("Okay, okay, okay, okay. Can you activate the terminal please?", True),
+    ("Hey Jarvis, could you turn off the terminal?", False),
+    ("Oye, ¿puedes desactivar la terminal por favor?", False),
+    ("Can you show me the terminal output of the last command?", None),
+    ("Open the terminal", None), ("Close the terminal", None), ("Abre la terminal", None),
+    ("What terminal app am I using and how do I change its colors?", None),
+    ("Thank you", None),
+])
+def test_terminal_switch(text, expected):
+    assert jarvis.terminal_switch(text) is expected

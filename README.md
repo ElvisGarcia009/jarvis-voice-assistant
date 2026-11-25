@@ -125,6 +125,7 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
 | Interrupt | Just start talking (or say "Hey Jarvis" in `wakeword` mode), click the orb, or the ■ button |
 | Cancel a request | Click ✕, or the orb while Jarvis is thinking: Claude stops right away |
 | Finish | Say "thank you" / "OK, thank you" / "that's all", stay silent, or click ✕ |
+| Show or hide the commands | Say "deactivate terminal" / "activate terminal" (or "desactiva la terminal" / "activa la terminal") |
 | Gaming mode | Say "turn on gaming mode" / "turn off gaming mode", or `touch` / `rm` `~/.local/state/jarvis/gaming_mode` |
 
 Service commands:

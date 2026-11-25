@@ -71,6 +71,9 @@ MEMORY_FILE = os.path.join(HOME, ".local", "state", "jarvis", "memory.json")
 GAMING_FLAG = os.path.join(STATE_DIR, "gaming_mode")
 # Every command Claude runs, with its output; a terminal window follows it live
 ACTIVITY_LOG = os.path.join(STATE_DIR, "activity.log")
+# "on" or "off", written by the voice commands "activate / deactivate terminal";
+# it wins over [activity] show_terminal
+ACTIVITY_SWITCH = os.path.join(STATE_DIR, "activity_terminal")
 STT_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_stt.py")
 
 DEFAULTS = {
@@ -94,6 +97,8 @@ DEFAULTS = {
         "timeout": "I'll be here if you need me.",
         "working": "One moment, I'm checking that.",   # said when Claude starts using
                                                        # tools; "" = stay silent
+        "terminal_on": "Terminal activated. I'll show you every command I run.",
+        "terminal_off": "Terminal deactivated. I'll keep working in the background.",
     },
     "claude": {"model": "sonnet", "permission_mode": "auto", "timeout": 300},
     "stt": {
@@ -305,6 +310,41 @@ def format_tool_output(text, is_error=False, full=True, max_lines=30, max_chars=
     return "".join(f"  {line}\n" for line in shown.splitlines())
 
 
+TERMINAL_OFF = re.compile(
+    r"\b(deactivate|disable|turn off|hide|desactiva|desactivar|apaga|apagar|oculta|ocultar|"
+    r"quita|quitar)( the| la| el)? terminal\b|\bturn( the)? terminal off\b")
+TERMINAL_ON = re.compile(
+    r"\b(activate|enable|turn on|show|activa|activar|enciende|encender|muestra|mostrar|"
+    r"pon)( the| la| el)? terminal\b|\bturn( the)? terminal on\b")
+
+
+# Words people add around a command ("okay, wait... can you deactivate the terminal please?")
+FILLER_WORDS = {
+    "okay", "ok", "wait", "yeah", "yes", "yep", "hey", "jarvis", "please", "can", "could",
+    "would", "will", "you", "um", "uh", "uhm", "eh", "so", "now", "just", "and", "alright",
+    "right", "well", "i", "want", "need", "to", "go", "ahead", "sir", "listen", "again",
+    "oye", "por", "favor", "puedes", "podrias", "quiero", "que", "ya", "bueno", "vale", "este",
+    "ahora", "mira", "otra", "vez",
+}
+
+
+def terminal_switch(text):
+    """True for "activate terminal", False for "deactivate terminal", else None.
+    Filler words are ignored; what is left must be just the command, so a real
+    request about a terminal still goes to Claude ("open the terminal" launches
+    the terminal app, so it is not a switch). Claude also knows how to flip the
+    switch, for other ways of saying it (see build_system_prompt)."""
+    words = [w for w in normalize(text).split() if w not in FILLER_WORDS]
+    if not words or len(words) > 4:
+        return None
+    clean = " ".join(words)
+    if TERMINAL_OFF.search(clean):
+        return False
+    if TERMINAL_ON.search(clean):
+        return True
+    return None
+
+
 def terminal_command(setting):
     """The command that opens a terminal running what follows it, or None."""
     if setting and setting != "auto":
@@ -323,7 +363,8 @@ class ActivityConsole:
 
     def __init__(self):
         ac = CFG["activity"]
-        self.show = bool(ac["show_terminal"])
+        self.default = bool(ac["show_terminal"])
+        self.broken = False      # no terminal app could be opened
         self.terminal = ac["terminal"]
         self.viewer = None
         self.request = None      # your request, written above its first command
@@ -356,7 +397,8 @@ class ActivityConsole:
                 text = f"\n{BOLD}━━ {time.strftime('%H:%M')}  {self.request}{RESET}\n"
                 self.request = None
             self._write(text + format_tool_call(name, block.get("input") or {}))
-            self._open_viewer(start)
+            if ACTIVITY_SWITCH not in json.dumps(block.get("input") or {}):
+                self._open_viewer(start)   # (not just to show the switch being flipped)
 
     def tool_result(self, block):
         content = block.get("content")
@@ -375,6 +417,22 @@ class ActivityConsole:
             if self.names:
                 self._write(f"{RED}  {text}{RESET}\n")
 
+    def enabled(self):
+        try:
+            with open(ACTIVITY_SWITCH) as f:
+                return f.read().strip() != "off"
+        except OSError:
+            return self.default
+
+    def set_enabled(self, on):
+        """The voice commands "activate terminal" / "deactivate terminal"."""
+        with open(ACTIVITY_SWITCH, "w") as f:
+            f.write("on\n" if on else "off\n")
+        self.broken = False
+        log.info("Activity terminal %s", "activated" if on else "deactivated")
+        if not on:
+            self.close()
+
     def close(self):
         """Closes the terminal window (Jarvis went back to sleep)."""
         with self.lock:
@@ -390,12 +448,12 @@ class ActivityConsole:
         log.info("Activity terminal closed")
 
     def _open_viewer(self, start):
-        if not self.show or (self.viewer and self.viewer.poll() is None):
+        if self.broken or not self.enabled() or (self.viewer and self.viewer.poll() is None):
             return
         command = terminal_command(self.terminal)
         if not command:
             log.info("No terminal app found: commands are only written to %s", ACTIVITY_LOG)
-            self.show = False
+            self.broken = True
             return
         script = ('printf "\\033]0;Jarvis activity\\007"; '
                   'echo "What Jarvis does on your computer. You can close this window."; '
@@ -408,7 +466,7 @@ class ActivityConsole:
             log.info("Activity terminal opened (%s)", command[0])
         except OSError as e:
             log.warning("Could not open the activity terminal: %s", e)
-            self.show = False
+            self.broken = True
 
 
 def notify(title, body):
@@ -488,6 +546,13 @@ HOW TO ACT:
   changing system settings, sending messages, buying something), do NOT do it yet: say what
   you will do and ask {who} to confirm with "yes". Only do it after the confirmation.
 - If you are not sure what {who} wants, ask in one sentence.
+
+ACTIVITY TERMINAL (a window that shows {who} every command you run, live, while you talk):
+- "Activate / deactivate the terminal" (or "show / hide the terminal", "activa / desactiva la
+  terminal") means this window, NOT opening or closing the terminal app.
+- Turn it on with: echo on > {ACTIVITY_SWITCH}
+- Turn it off with: echo off > {ACTIVITY_SWITCH}
+- It is off only if that file contains "off". Jarvis applies the change right away.
 
 GAMING MODE (keeps your speech recognition off the graphics card so games get all the VRAM):
 - Turn it on with: touch {GAMING_FLAG}
@@ -1442,6 +1507,8 @@ class Assistant:
             # you interrupted: let Claude finish its task silently (your words are kept)
             self.ui("set_state", "listening")
             thread.join()
+        if not self.console.enabled():
+            self.console.close()   # Claude turned the activity terminal off
         if said:
             log.info("Jarvis: %s", " ".join(said))
 
@@ -1536,6 +1603,11 @@ class Assistant:
                 text = text.rstrip(" .…") + " " + extra
             log.info("User: %s", text)
             self.ui("add_message", "user", text)
+            switch = terminal_switch(text)
+            if switch is not None:   # "activate terminal" / "deactivate terminal"
+                self.console.set_enabled(switch)
+                self.speak(p["terminal_on" if switch else "terminal_off"])
+                continue
             if is_goodbye(text):
                 self.speak(p["goodbye"], interruptible=False)
                 return
