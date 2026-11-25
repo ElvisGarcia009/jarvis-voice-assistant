@@ -17,6 +17,7 @@ Jarvis is a small Python app that connects a wake word, speech recognition and a
 - **Fast local voice**: [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) speaks while the rest of the answer is still being generated. You can blend voices and make them deeper. Edge TTS is available as an online alternative or fallback.
 - **Private, offline speech recognition**: Whisper runs on your own GPU or CPU with [faster-whisper](https://github.com/SYSTRAN/faster-whisper), so your voice never leaves your computer and no account is needed. On an RTX 4060 it transcribes a sentence in under half a second. Groq's free online Whisper API is available as an alternative.
 - **Leaves your GPU to your games**: the Whisper model (int8, about 1.3 GB of VRAM) only loads when you say "Hey Jarvis" and is freed a minute after the conversation, so a sleeping Jarvis uses no VRAM. Say "turn on gaming mode" and speech recognition moves to the CPU while you play.
+- **See what it does**: when Claude runs a command, a terminal window opens and shows every command and its output live, so you always know what Jarvis is doing on your PC. The same window follows the whole conversation and closes when Jarvis goes back to sleep.
 - **Interrupt by voice**: start talking while Jarvis speaks and he stops and listens, keeping your first words. With speakers instead of a headset, switch to `wakeword` mode and say "Hey Jarvis" to interrupt.
 - **Natural conversation**: keep talking without repeating the wake word. Say "thank you" (or "OK, thank you", "that's all", "gracias"...) and Jarvis goes back to sleep.
 - **Memory with automatic compaction**: wake Jarvis again within a few hours and he continues the same conversation. When it grows too large, he summarizes it into short notes and starts fresh with that memory, so answers stay fast and cheap.
@@ -161,6 +162,7 @@ model = "sonnet"      # fast for voice; "opus" is smarter but slower
 Jarvis gives a voice interface to a tool that can run commands on your computer. Please read this section.
 
 - Anyone (or any video) near your microphone can say "Hey Jarvis". **Use a headset** and keep Jarvis off when you share the room or stream.
+- Every command Jarvis runs is shown live in a terminal window (`[activity] show_terminal`) and saved in `~/.local/state/jarvis/activity.log`.
 - Jarvis runs Claude Code with `--permission-mode auto`, which lets Claude Code's safety classifier block risky actions. Its instructions also tell it to ask for a spoken "yes" before deleting, uninstalling or changing settings. **Do not switch to `bypassPermissions`.**
 - `sudo` does not work from Jarvis. It tells you to run those commands yourself.
 - Conversation memory (a short summary and the session id) is stored locally in `~/.local/state/jarvis/memory.json`. Delete it to make Jarvis forget.

@@ -36,6 +36,7 @@ import os
 import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -68,6 +69,8 @@ GROQ_KEY_FILE = os.path.join(CONFIG_DIR, "groq_key")
 MEMORY_FILE = os.path.join(HOME, ".local", "state", "jarvis", "memory.json")
 # While this file exists, speech recognition stays off the GPU (to leave all VRAM to games)
 GAMING_FLAG = os.path.join(STATE_DIR, "gaming_mode")
+# Every command Claude runs, with its output; a terminal window follows it live
+ACTIVITY_LOG = os.path.join(STATE_DIR, "activity.log")
 STT_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_stt.py")
 
 DEFAULTS = {
@@ -118,6 +121,11 @@ DEFAULTS = {
     "listening": {"wait_for_speech": 10.0, "end_silence": 2.0, "max_utterance": 60.0,
                   "continue_wait": 4.0},
     "ui": {"show_on_start": False},
+    "activity": {
+        "show_terminal": True,   # open a terminal that shows the commands Claude runs
+        "terminal": "auto",      # "auto" or a command that runs what follows it,
+                                 # e.g. "gnome-terminal --" or "kitty"
+    },
     "interrupt": {
         "mode": "voice",        # "voice": just start talking | "wakeword": say "Hey Jarvis" | "off"
         "min_speech": 0.30,     # seconds of your voice needed to interrupt (avoids coughs)
@@ -257,6 +265,150 @@ class SentenceStream:
         """Returns whatever is left (the end of a reply), as one last sentence."""
         rest, self.buf = " ".join(self.buf.split()), ""
         return [rest] if rest else []
+
+
+# Terminal apps and the option that makes them run a command, most likely first
+# (the app must stay running while its window is open, so Jarvis can reuse and close it)
+TERMINALS = [("cosmic-term", ["-e"]), ("ptyxis", ["--"]), ("gnome-terminal", ["--wait", "--"]),
+             ("konsole", ["-e"]), ("xfce4-terminal", ["--disable-server", "-x"]), ("kitty", []),
+             ("alacritty", ["-e"]), ("foot", []), ("xterm", ["-e"]),
+             ("x-terminal-emulator", ["-e"])]
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+BOLD, DIM, RED, GREEN, CYAN, RESET = ("\x1b[1m", "\x1b[2m", "\x1b[31m", "\x1b[32m",
+                                       "\x1b[36m", "\x1b[0m")
+
+
+def format_tool_call(name, args):
+    """One tool call as the activity terminal shows it: `$ command` for the shell."""
+    if name == "Bash":
+        note = f"{DIM}# {args['description']}{RESET}\n" if args.get("description") else ""
+        return f"{note}{GREEN}${RESET} {BOLD}{args.get('command', '')}{RESET}\n"
+    detail = next((str(args[k]) for k in ("file_path", "path", "pattern", "url", "query",
+                                          "description", "prompt") if args.get(k)), "")
+    return f"{CYAN}▸ {name}{RESET} {detail[:200]}\n"
+
+
+def format_tool_output(text, is_error=False, full=True, max_lines=30, max_chars=4000):
+    """A tool's result: the whole output for shell commands (cut if long), a short
+    summary for the rest (file contents, search results...)."""
+    text = ANSI.sub("", text).replace("\r", "").rstrip()
+    if not text:
+        return f"{DIM}  (no output){RESET}\n" if not is_error else ""
+    lines = text.splitlines()
+    if not full and not is_error:
+        return f"{DIM}  ↳ {len(lines)} line{'s' if len(lines) != 1 else ''}{RESET}\n"
+    shown = "\n".join(lines[:max_lines])[:max_chars]
+    if len(lines) > max_lines or len(text) > len(shown):
+        shown += f"\n… ({len(lines) - shown.count(chr(10)) - 1} more lines)"
+    if is_error:
+        return "".join(f"{RED}  {line}{RESET}\n" for line in shown.splitlines())
+    return "".join(f"  {line}\n" for line in shown.splitlines())
+
+
+def terminal_command(setting):
+    """The command that opens a terminal running what follows it, or None."""
+    if setting and setting != "auto":
+        return shlex.split(setting)
+    for name, option in TERMINALS:
+        if shutil.which(name):
+            return [name, *option]
+    return None
+
+
+class ActivityConsole:
+    """Shows what Claude does on the computer: every command and its output is
+    written to activity.log, and a terminal window follows that file live. It
+    opens with the first command, is reused for the next ones and closes when
+    the conversation ends."""
+
+    def __init__(self):
+        ac = CFG["activity"]
+        self.show = bool(ac["show_terminal"])
+        self.terminal = ac["terminal"]
+        self.viewer = None
+        self.request = None      # your request, written above its first command
+        self.names = {}          # tool call id -> tool name
+        self.lock = threading.Lock()
+        try:   # keep the file small: start over when it passes 1 MB
+            if os.path.getsize(ACTIVITY_LOG) > 1_000_000:
+                os.replace(ACTIVITY_LOG, ACTIVITY_LOG + ".old")
+        except OSError:
+            pass
+
+    def start(self, text):
+        with self.lock:
+            self.request, self.names = text, {}
+
+    def _write(self, text):
+        with open(ACTIVITY_LOG, "a") as f:
+            f.write(text)
+
+    def tool_call(self, block):
+        with self.lock:
+            name = block.get("name") or "?"
+            self.names[block.get("id")] = name
+            try:
+                start = os.path.getsize(ACTIVITY_LOG)
+            except OSError:
+                start = 0
+            text = ""
+            if self.request is not None:
+                text = f"\n{BOLD}━━ {time.strftime('%H:%M')}  {self.request}{RESET}\n"
+                self.request = None
+            self._write(text + format_tool_call(name, block.get("input") or {}))
+            self._open_viewer(start)
+
+    def tool_result(self, block):
+        content = block.get("content")
+        if isinstance(content, list):
+            content = "\n".join(c.get("text", "") for c in content
+                                if isinstance(c, dict) and c.get("type") == "text")
+        with self.lock:
+            name = self.names.get(block.get("tool_use_id"))
+            if name:
+                self._write(format_tool_output(str(content or ""), bool(block.get("is_error")),
+                                               full=name == "Bash"))
+
+    def note(self, text):
+        """A line after the commands of this request (cancelled, too slow...)."""
+        with self.lock:
+            if self.names:
+                self._write(f"{RED}  {text}{RESET}\n")
+
+    def close(self):
+        """Closes the terminal window (Jarvis went back to sleep)."""
+        with self.lock:
+            viewer, self.viewer = self.viewer, None
+        if viewer is None or viewer.poll() is not None:
+            return
+        viewer.terminate()
+        try:
+            viewer.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            viewer.kill()
+            viewer.wait()
+        log.info("Activity terminal closed")
+
+    def _open_viewer(self, start):
+        if not self.show or (self.viewer and self.viewer.poll() is None):
+            return
+        command = terminal_command(self.terminal)
+        if not command:
+            log.info("No terminal app found: commands are only written to %s", ACTIVITY_LOG)
+            self.show = False
+            return
+        script = ('printf "\\033]0;Jarvis activity\\007"; '
+                  'echo "What Jarvis does on your computer. You can close this window."; '
+                  'exec tail -c "+$1" -F "$2"')
+        try:
+            self.viewer = subprocess.Popen(
+                command + ["bash", "-c", script, "jarvis", str(start + 1), ACTIVITY_LOG],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            log.info("Activity terminal opened (%s)", command[0])
+        except OSError as e:
+            log.warning("Could not open the activity terminal: %s", e)
+            self.show = False
 
 
 def notify(title, body):
@@ -601,6 +753,7 @@ class Assistant:
         self.groq_key = self._load_groq_key()
         # loaded on demand when Jarvis wakes up, freed after the conversation
         self.stt = LocalSTT() if CFG["stt"]["engine"] == "local" else None
+        self.console = ActivityConsole()
         self.system_prompt = build_system_prompt()
         self.window = None
         self.manual_wake = threading.Event()
@@ -1128,7 +1281,8 @@ class Assistant:
     def _run_claude_stream(self, text, model, session, system_prompt, on_event):
         """Runs Claude Code and reads its answer while it is being written.
         `on_event(kind, value)` gets ("session", id), ("text", piece), ("text_end", None)
-        and ("tool", name). Claude is stopped on timeout or when you end the
+        ("tool", name) as soon as a tool starts, then ("tool_call", block) with its full
+        input and ("tool_result", block). Claude is stopped on timeout or when you end the
         conversation (✕, or the orb while thinking). Returns (result event or None,
         status, other output), status being "ok", "timeout" or "cancelled"."""
         c = CFG["claude"]
@@ -1190,6 +1344,12 @@ class Assistant:
                         on_event("tool", block.get("name") or "")
                     elif ev.get("type") == "content_block_stop":
                         on_event("text_end", None)
+                elif kind in ("assistant", "user"):
+                    for block in (event.get("message") or {}).get("content") or []:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            on_event("tool_call", block)
+                        elif isinstance(block, dict) and block.get("type") == "tool_result":
+                            on_event("tool_result", block)
                 elif kind == "result":
                     result = event
                     deadline = min(deadline, time.monotonic() + 10)   # it should exit now
@@ -1228,6 +1388,7 @@ class Assistant:
         being written (Claude runs in a background thread)."""
         c = CFG["claude"]
         log.info("Asking Claude: %s", text)
+        self.console.start(text)
         sentences = queue.Queue()     # complete sentences to speak; None = the end
         splitter = SentenceStream()
         said = []                     # what Jarvis says, for the bubble and the log
@@ -1254,6 +1415,11 @@ class Assistant:
                 log.info("Claude is using %s", value)
                 if not said:   # nothing said yet: avoid a long silence while it works
                     say([CFG["phrases"]["working"]])
+            elif kind in ("tool_call", "tool_result"):
+                try:
+                    (self.console.tool_call if kind == "tool_call" else self.console.tool_result)(value)
+                except Exception as e:
+                    log.warning("Activity terminal: %s", e)
 
         def worker():
             try:
@@ -1306,7 +1472,9 @@ class Assistant:
             self.session = info["session"]
         if status == "cancelled":
             log.info("Request cancelled by the user")
+            self.console.note("✕ Cancelled")
         elif status == "timeout":
+            self.console.note("⏱ Stopped: it was taking too long")
             say(["That is taking too long. It's better to do it directly in Claude Code."])
         elif data is None:
             log.error("Unexpected Claude output: %s", output[-500:])
@@ -1403,6 +1571,7 @@ class Assistant:
         self.wake.reset()
         self.mic.flush()
         self.ui("sleep_and_hide")
+        self.console.close()
         if self.stt:
             self.stt.unload_later(float(CFG["stt"]["unload_after"]))
         # auto-compact after the conversation, so it never delays an answer

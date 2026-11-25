@@ -112,3 +112,14 @@ vad_threshold = 0.50  # how sure it must be that it's a human voice (0 to 1)
 [ui]
 # Show the window when Jarvis starts (otherwise it appears when you wake it up)
 show_on_start = false
+
+[activity]
+# See what Jarvis does on your computer: when Claude runs its first command, a
+# terminal window opens and shows every command and its output, live. The same
+# window is used for the rest of the conversation and closes when Jarvis goes back
+# to sleep. Everything is also saved in ~/.local/state/jarvis/activity.log
+show_terminal = true
+# "auto" finds your terminal app (COSMIC Terminal, GNOME Terminal, Konsole...).
+# Or give a command that runs what follows it and stays open with its window,
+# e.g. "gnome-terminal --wait --" or "kitty".
+terminal = "auto"
