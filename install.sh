@@ -86,7 +86,7 @@ if [ "$NEW_CONFIG" = 1 ]; then
   echo "  1) On this computer: private, works offline, no account needed."
   echo "     Downloads a ~1.6 GB model (plus ~2 GB of GPU libraries with an NVIDIA card)."
   echo "  2) Online with Groq: smaller download, needs a free Groq API key."
-  read -rp "Choose 1 or 2 [1]: " STT_CHOICE
+  read -rp "Choose 1 or 2 [1]: " STT_CHOICE || STT_CHOICE=""   # no terminal: default
   if [ "${STT_CHOICE:-1}" = "2" ]; then STT_ENGINE="groq"; else STT_ENGINE="local"; fi
   # set `engine = ...` inside the [stt] section only
   awk -v e="$STT_ENGINE" '
@@ -117,7 +117,7 @@ if [ "$STT_ENGINE" != "local" ] && [ ! -s "$CONFIG_DIR/groq_key" ]; then
   echo
   echo "Jarvis uses Groq (free) to turn your voice into text."
   echo "Create a key at https://console.groq.com/keys and paste it below (it stays hidden)."
-  read -rsp "Groq API key: " GROQ_KEY; echo
+  read -rsp "Groq API key: " GROQ_KEY || GROQ_KEY=""; echo
   [ -n "$GROQ_KEY" ] || fail "No key entered."
   ( umask 077; printf '%s\n' "$GROQ_KEY" > "$CONFIG_DIR/groq_key" )
   unset GROQ_KEY
@@ -134,7 +134,6 @@ if [ -z "$CLAUDE_BIN" ]; then
   echo "    claude auth login"
 else
   say "Claude Code found: $CLAUDE_BIN"
-  echo "    If you have never logged in from a terminal, run:  $CLAUDE_BIN auth login"
 fi
 
 # ---------------------------------------------------------------- 7. service
@@ -144,7 +143,57 @@ systemctl --user daemon-reload
 systemctl --user enable jarvis.service >/dev/null 2>&1
 systemctl --user restart jarvis.service
 
+# ---------------------------------------------------------------- 8. summary
+ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+miss() { printf '  \033[1;31m✗\033[0m %s\n' "$*"; PROBLEMS=1; }
+opt()  { printf '  \033[1;33m•\033[0m %s\n' "$*"; }
+PROBLEMS=0
+sleep 3   # give the service a moment to start
 echo
-say "Done! Say \"Hey Jarvis\" to start."
+say "Summary"
+if systemctl --user is-active --quiet jarvis.service; then
+  ok "Jarvis is running in the background (starts with your desktop)"
+else
+  miss "Jarvis is not running: see  journalctl --user -u jarvis -n 30"
+fi
+if [ "$STT_ENGINE" = "local" ]; then
+  if "$VENV/bin/python" -c 'import faster_whisper' 2>/dev/null; then
+    if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+      ok "Speech recognition: on this computer, with your NVIDIA GPU"
+    else
+      ok "Speech recognition: on this computer, on the CPU"
+    fi
+  else
+    miss "Speech recognition: faster-whisper is not installed (run ./install.sh again)"
+  fi
+elif [ -s "$CONFIG_DIR/groq_key" ]; then
+  ok "Speech recognition: online with Groq (key saved)"
+else
+  miss "Speech recognition: Groq key missing (run ./install.sh again)"
+fi
+if [ -z "$CLAUDE_BIN" ]; then
+  miss "Claude Code: not installed  →  curl -fsSL https://claude.ai/install.sh | bash"
+elif "$CLAUDE_BIN" auth status 2>/dev/null | grep -q '"loggedIn": *true'; then
+  ok "Claude Code: installed and logged in"
+else
+  miss "Claude Code: not logged in  →  $CLAUDE_BIN auth login   (then: systemctl --user restart jarvis)"
+fi
+if python3 -c 'import gi; gi.require_version("GtkLayerShell", "0.1")' 2>/dev/null; then
+  ok "Floating bubble stays above all windows (gtk-layer-shell)"
+else
+  opt "Optional: gtk-layer-shell, so the bubble floats above all windows"
+fi
+if command -v playerctl >/dev/null; then
+  ok "Fewer false wake-ups while videos or music play (playerctl)"
+else
+  opt "Optional: playerctl, so videos and music are less likely to wake Jarvis"
+fi
+echo
+if [ "$PROBLEMS" = 0 ]; then
+  say "Done! Say \"Hey Jarvis\" to start."
+else
+  warn "Almost done: fix the items marked ✗, then say \"Hey Jarvis\"."
+fi
 echo "    Settings: $CONFIG_DIR/config.toml   (then: systemctl --user restart jarvis)"
 echo "    Log:      ~/.local/state/jarvis/jarvis.log"
+echo "    Update:   run the same install command again"

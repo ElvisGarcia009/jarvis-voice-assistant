@@ -87,6 +87,8 @@ python3 benchmark.py tokens          # tokens and cost of every question you ask
 ~/.local/share/jarvis/venv/bin/python benchmark.py tokens --live --model sonnet   # three sample questions
 ```
 
+A narrated architecture walkthrough (Spanish, ~31 min) with its storyboard and Mermaid diagrams lives in [`docs/architecture-video`](docs/architecture-video/README.md).
+
 ## Requirements
 
 - Linux with **PipeWire** (`pw-record`, `pw-play`) and **systemd**. This covers most modern distributions.
@@ -101,25 +103,38 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
 
 ## Installation
 
-1. Install the system packages:
-
-   ```bash
-   # Debian / Ubuntu / Pop!_OS
-   sudo apt install python3-venv python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-gtklayershell-0.1 pipewire-bin curl git
-   # Fedora
-   sudo dnf install python3-gobject python3-cairo gtk3 gtk-layer-shell pipewire-utils curl git
-   # Arch
-   sudo pacman -S python-gobject python-cairo gtk3 gtk-layer-shell pipewire curl git
-   ```
-
-2. Install Claude Code and log in, if you have not already:
+1. Install Claude Code and log in, if you have not already:
 
    ```bash
    curl -fsSL https://claude.ai/install.sh | bash
    claude auth login
    ```
 
-3. Clone this repository and run the installer:
+2. Install Jarvis with one command:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/ElvisGarcia009/jarvis-voice-assistant/main/get.sh | bash
+   ```
+
+   It downloads Jarvis to `~/.local/src/jarvis-voice-assistant`, offers to install the system packages it needs (it asks before using `sudo`), asks how to recognize your voice (locally or with Groq), downloads the models and starts Jarvis as a background service. At the end it shows a summary of what works and what is still missing. Run the same command again later to update Jarvis; your settings are kept.
+
+3. Say **"Hey Jarvis"**.
+
+<details>
+<summary>Manual installation (without the one-command installer)</summary>
+
+1. Install the system packages:
+
+   ```bash
+   # Debian / Ubuntu / Pop!_OS
+   sudo apt install python3-venv python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-gtklayershell-0.1 pipewire-bin curl git playerctl
+   # Fedora
+   sudo dnf install python3-gobject python3-cairo gtk3 gtk-layer-shell pipewire-utils curl git playerctl
+   # Arch
+   sudo pacman -S python-gobject python-cairo gtk3 gtk-layer-shell pipewire curl git playerctl
+   ```
+
+2. Clone this repository and run the installer (it does not need `sudo`):
 
    ```bash
    git clone https://github.com/ElvisGarcia009/jarvis-voice-assistant.git
@@ -127,9 +142,7 @@ Tested on Pop!_OS 24.04 (COSMIC, Wayland).
    ./install.sh
    ```
 
-   The installer asks how to recognize your voice (locally or with Groq), downloads the models, and starts Jarvis as a background service. It does not need `sudo`.
-
-4. Say **"Hey Jarvis"**.
+</details>
 
 ## Usage
 
